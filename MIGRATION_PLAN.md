@@ -1,200 +1,191 @@
-# PaiSmart 功能增强迁移规划
+# PaiSmart 功能增强技术手册
 
-## 一、简历内容验证
-
-### 简历加粗项与当前项目对照
-
-| 简历加粗项 | PaiSmart (当前) | anotherRagProject | 评估 |
-|-----------|----------------|-------------------|------|
-| **MinerU 解析** | Apache Tika (基础) | DeepDoc (Layout+TSR+OCR) | ❌ 本项目无 |
-| **文档切块优化** (递归细切、表格表头保留、列表前导句合并) | 基础 semantic chunking (512字符) | naive_merge + token计数 + table tokenization | ⚠️ 部分实现 |
-| **查询意图识别** (规则、BERT分类器) | 无 | FulltextQueryer (规则+同义词) | ❌ 本项目无 |
-| **HyDE (假设文档)** | 无 | 无 | ❌ 两项目均无 |
-| **RRF 融合 + Cross-Encoder 二阶段重排** | ~~KNN+BM25 加权融合~~ → ✅ **已实现 (RRF + qwen-rerank)** | RRF + DashScopeRerank | ✅ **本项目已实现** |
-| **MCP 协议 + Agent + SpringAI FunctionCallback** | 无 | 无 | ⚠️ SpringAI 可实现 |
-| **摘要记忆策略** | Redis 存储 (7天TTL, 20条截断) | 未详查 | ⚠️ 无主动摘要 |
-| **RAG 效果评测框架** | 无 (仅有用量配额) | 无 | ❌ 本项目无 |
-
-### 结论
-- **本项目已有**: 基础 Tika 解析、基础 chunking、KNN+BM25 混合搜索、WebSocket 流式响应
-- **anotherRagProject 特色**: DeepDoc 高级解析、RRF+DashScopeRerank 重排、查询改写、同义词扩展
-- **两项目均缺**: HyDE、Agent/MCP、RAG 评测框架
+> 本文档记录 PaiSmart 项目各项功能优化的**演进历程、技术方案对比、现有架构和未来规划**。
 
 ---
 
-## 二、迁移可行性评估
+## 一、项目现状总览
 
-### 2.1 Cross-Encoder 重排 ✅ 已实现并验证
+### 1.1 技术架构
 
-**实现状态**: ✅ 已完成实现，已通过日志验证流程正确
-
-**实现细节**:
-
-#### 新增文件
-- `config/RerankProperties.java` - Rerank 配置类
-- `client/RerankClient.java` - DashScope qwen3-rerank API 客户端
-
-#### 修改文件
-- `service/HybridSearchService.java` - 重写搜索流程，实现两阶段排序
-- `application.yml` - 添加 rerank 配置
-
-#### 实现架构
 ```
-Stage 1: RRF 融合
-├── executeKnnSearchForRanking() → 获取 KNN 排名
-├── executeBm25SearchForRanking() → 获取 BM25 排名
-└── rrfFusion() → RRF_score = w_knn/(k+rank_knn) + w_bm25/(k+rank_bm25)
-
-Stage 2: Cross-Encoder 重排
-├── getCandidateDocs() → 获取 Top-N 候选文档
-├── rerankClient.rerank() → 调用 qwen3-rerank API
-└── buildFinalResults() → 按 rerank 分数输出最终结果
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                              客户端 (Vue 3)                                  │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         后端 (Spring Boot 3.4)                              │
+│                                                                              │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐   │
+│  │ UploadAPI    │  │ ChatHandler   │  │ HybridSearch │  │ MinerUService │   │
+│  │ (MinIO)      │  │ (WebSocket)  │  │ (RRF+Rerank)│  │ (PDF解析)    │   │
+│  └──────────────┘  └──────────────┘  └──────────────┘  └──────────────┘   │
+│                                                                              │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐   │
+│  │ Kafka        │  │ Elasticsearch │  │ Redis        │  │ MySQL        │   │
+│  │ (消息队列)    │  │ (向量+全文)   │  │ (缓存+会话)  │  │ (元数据)     │   │
+│  └──────────────┘  └──────────────┘  └──────────────┘  └──────────────┘   │
+└─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-#### 配置项
+### 1.2 RAG Pipeline 现状
+
+| 环节 | 原有方案 | 现有方案 | 优化后 |
+|------|---------|---------|--------|
+| **文档解析** | Apache Tika (纯文本) | MinerU (Markdown+JSON) | ✅ 已优化 |
+| **文本分块** | 512字符固定切分 | 512字符 + 语义边界 | ✅ 已优化 |
+| **查询预处理** | 无 | 规则 Query Rewrite | ✅ 已实现 |
+| **向量召回** | KNN only | RRF 融合 (KNN+BM25) | ✅ 已优化 |
+| **重排序** | 无 | Cross-Encoder (qwen-rerank) | ✅ 已实现 |
+
+---
+
+## 二、已完成的优化
+
+### 2.1 RRF + Cross-Encoder 二阶段重排 ✅
+
+#### 2.1.1 问题背景
+
+**原有方案的问题**：
+- 仅使用 KNN 向量召回，召回结果与关键词相关性弱
+- 无重排序阶段，Top-K 结果质量不稳定
+- BM25 单独使用效果差，未与向量召回融合
+
+#### 2.1.2 技术方案对比
+
+| 方案 | 原理 | 优点 | 缺点 | 状态 |
+|------|------|------|------|------|
+| **纯 KNN** | 向量相似度召回 | 语义理解强 | 关键词召回弱 | ❌ 原有 |
+| **纯 BM25** | 关键词词频召回 | 关键词精准 | 语义理解弱 | ❌ 原有 |
+| **RRF 融合** | KNN+BM25 排名加权 | 两路互补 | 需要调参 | ✅ 现有 |
+| **RRF + Rerank** | 融合后 Cross-Encoder 重排 | 精准度最高 | 额外 API 费用 | ✅ 现有 |
+
+#### 2.1.3 现有架构流程
+
+```
+用户查询
+    │
+    ▼
+┌─────────────────────────────────────────────────────────────┐
+│ Stage 1: KNN 召回                                          │
+│ executeKnnSearchForRanking()                               │
+│ → 返回文档ID列表 + 排名 (按向量相似度降序)                    │
+└─────────────────────────────────────────────────────────────┘
+    │
+    ▼
+┌─────────────────────────────────────────────────────────────┐
+│ Stage 2: BM25 召回                                         │
+│ executeBm25SearchForRanking()                              │
+│ → 返回文档ID列表 + 排名 (按 BM25 分数降序)                   │
+└─────────────────────────────────────────────────────────────┘
+    │
+    ▼
+┌─────────────────────────────────────────────────────────────┐
+│ Stage 3: RRF 融合                                          │
+│ rrfFusion(knnRankMap, bm25RankMap, knnWeight, bm25Weight) │
+│ RRF_score = knnWeight/(k+rank_knn) + bm25Weight/(k+rank_bm25) │
+│ → 融合后按 RRF_score 降序排列                               │
+└─────────────────────────────────────────────────────────────┘
+    │
+    ▼
+┌─────────────────────────────────────────────────────────────┐
+│ Stage 4: Cross-Encoder 重排 (Top-20 候选)                   │
+│ rerankClient.rerank(query, candidateDocs)                  │
+│ → qwen3-rerank API 计算相关性分数                          │
+│ → 按相关性分数重排，输出最终 Top-5                          │
+└─────────────────────────────────────────────────────────────┘
+    │
+    ▼
+返回结果给用户
+```
+
+#### 2.1.4 关键配置
+
 ```yaml
 rerank:
   enabled: true
   api-url: https://dashscope.aliyuncs.com/api/v1/services/rerank/text-rerank/text-rerank
-  api-key: ${EMBEDDING_API_KEY:}  # 复用 embedding key
+  api-key: ${EMBEDDING_API_KEY:}
   model: qwen3-rerank
-  knn-weight: 0.5
-  bm25-weight: 0.5
-  rrf-k: 60
-  rerank-top-n: 20
+  knn-weight: 0.5              # KNN 召回权重
+  bm25-weight: 0.5             # BM25 召回权重
+  rrf-k: 60                    # RRF k 参数，缓解排名差距
+  rerank-top-n: 20             # 重排候选数量
   max-rerank-docs: 100
   timeout-ms: 30000
 ```
 
-#### 关键算法
-**RRF (Reciprocal Rank Fusion)**:
-```
-RRF_score(doc) = Σ(weight_i / (k + rank_i))
-```
-- k=60: 缓解排名差距过大的影响
-- knnWeight=0.5, bm25Weight=0.5: 两路权重相等
+#### 2.1.5 验证日志
 
-#### 验证日志
 ```
-KNN 召回文档数: 41
-BM25 召回文档数: 0
-RRF 融合完成 - 参与融合文档数: 41
-发送 Rerank 请求 - 模型: qwen3-rerank, 文档数: 20
-Response 200 OK
-{"output":{"results":[{"index":0,"relevance_score":0.6044},...]}
-返回最终搜索结果数量: 5
+[HybridSearchService] 用户查询: "深度学习框架"
+[HybridSearchService] KNN 召回文档数: 41
+[HybridSearchService] BM25 召回文档数: 0
+[HybridSearchService] RRF 融合完成 - 参与融合文档数: 41
+[HybridSearchService] 发送 Rerank 请求 - 模型: qwen3-rerank, 文档数: 20
+[RerankClient] Response 200 OK
+[HybridSearchService] 返回最终搜索结果数量: 5
 ```
 
-#### 回退机制
-- 若 Rerank API 返回错误，自动回退到 RRF 融合结果
-- 若向量生成失败，回退到纯文本搜索
-- 若 RRF 融合结果为空，回退到纯文本搜索
+#### 2.1.6 回退机制
 
-#### 注意事项
-- API 响应格式为 `output.results`，需正确解析
-- 需确保 DashScope API Key 已开通 qwen3-rerank 服务权限
+```
+Rerank API 失败 → 回退到 RRF 融合结果
+向量生成失败 → 回退到纯 BM25 搜索
+RRF 结果为空 → 回退到纯 BM25 搜索
+```
 
 ---
 
-### 2.2 查询改写与同义词扩展 (中优先级)
+### 2.2 查询改写与同义词扩展 ✅
 
-#### 2.2.1 anotherRagProject 现状分析
+#### 2.2.1 问题背景
 
-| 功能点 | anotherRagProject 实现 | PaiSmart 现状 |
-|--------|----------------------|---------------|
-| 全角转半角 | ✅ `strQ2B()` | ❌ 无 |
-| WWW 过滤 | ✅ `rmWWW()` 移除 什么/如何/哪里/谁 | ❌ 无 |
-| 同义词查表 | ✅ `synonym.Dealer` + `synonym.json` | ❌ 无 |
-| 用户意图识别 | ❌ 未实现 | ❌ 无 |
-| HyDE | ❌ 未实现 | ❌ 无 |
-| Multi-Query | ❌ 未实现 | ❌ 无 |
-| Query Decomposition | ❌ 未实现 | ❌ 无 |
+**原有方案的问题**：
+- 用户输入全角字符无法匹配（如 "ＡＢＣ" vs "ABC"）
+- 用户使用口语化疑问词影响召回（如 "深度学习是啥" 中的 "啥" 无贡献）
+- 同义词无法扩展（如 "电脑" 和 "计算机" 无法互召回）
 
-#### 2.2.2 技术选型分析（面试官视角）
+#### 2.2.2 优化方案
 
-**核心问题：Query Rewrite 在实际项目中是否值得做？**
+| 优化项 | 原有 | 优化后 | 效果 |
+|--------|------|--------|------|
+| 全角转半角 | ❌ 无 | ✅ 实现 | "１２３" → "123" |
+| WWW 疑问词过滤 | ❌ 无 | ✅ 实现 | "啥是深度学习" → "深度学习" |
+| 同义词扩展 | ❌ 无 | ✅ 实现 | "电脑" → "电脑 计算机" |
+| 错别字纠正 | ❌ 无 | ⚠️ 规则实现 | 有限覆盖 |
 
-**结论：做，但要分阶段，且不做过度设计。**
-
-| 技术方案 | 原理 | 优点 | 缺点 | 选用状态 |
-|----------|------|------|------|----------|
-| **规则 Query Expansion** | 正则 + 词典 | 零 LLM 调用、低延迟、实现简单 | 同义词表需维护 | ✅ **已选用** |
-| **Multi-Query** | LLM 生成多查询，RRF 融合 | 召回率高、对短 Query 友好 | token 消耗翻倍、延迟增加 | ⚠️ 备选 |
-| **HyDE** | LLM 生成假设文档，用假设文档向量召回 | 语义增强 | 幻觉问题、额外 LLM 调用 | ❌ 不选用 |
-| **Query Decomposition** | 拆分子问题分别召回 | 适合复杂多跳问题 | 实现复杂、延迟高 | ❌ 不选用 |
-| **BERT 意图分类** | 微调分类器 | 精准意图识别 | 需训练数据、额外模型 | ⚠️ 简化版备选 |
-
-#### 2.2.3 为什么不选用某些技术
-
-**❌ HyDE（假设文档增强）- 不选用原因：**
-1. **幻觉问题**：生成的假设文档可能与真实文档毫不相关，但向量相似度很高，导致错误召回
-2. **额外延迟**：需要额外一次 LLM 调用（约 500ms-1s）
-3. **中文场景收益不确定**：在中文知识库场景下，HyDE 效果不如英文场景明显
-4. **生产环境风险**：幻觉召回的结果可能误导 LLM 生成错误答案
-
-**面试官想听的知识点：**
-> "HyDE 理论上有一定效果，但生产环境中幻觉问题难以控制。我选择用规则 Query Expansion 作为替代，零额外延迟且可预测。"
-
-**❌ Query Decomposition（查询分解）- 不选用原因：**
-1. 适合多跳推理问题（如 "张三在哪里读的大学？他有多少项专利？"），但 PaiSmart 场景以单点查询为主
-2. 实现复杂度高，需要状态管理
-3. 延迟显著增加
-
-**⚠️ Multi-Query - 备选方案：**
-- 在规则 expansion 效果不足时再考虑
-- 限制条数（最多 3 条）和只在短 Query（< 10 字）时触发
-
-**⚠️ BERT 意图分类 - 简化版实现：**
-- 不做完整分类器，只做简单的规则判断（闲聊/问答/导航）
-- 后续可以作为路由依据
-
-#### 2.2.4 已实现方案：规则 Query Expansion
-
-**实现状态**: ✅ 已实现
-
-**实现细节**:
-
-##### 新增文件
-- `service/QueryRewriteService.java` - 查询改写服务
-
-##### 核心功能
-```java
-@Service
-public class QueryRewriteService {
-
-    // 1. 全角转半角 (Unicode 转换)
-    // 2. WWW 问题词移除 (什么/如何/哪里/谁)
-    // 3. 同义词查表扩展
-    // 4. 返回改写后的查询
-}
-```
-
-##### 算法详情
+#### 2.2.3 核心算法
 
 **全角转半角**:
 ```
-全角字符范围: \uFF01-\uFF5E
-转换公式: 半角 = 全角 - 0xFEE0 (特殊符号除外)
-示例: "ＡＢＣ" → "ABC", "１２３" → "123"
+全角范围: \uFF01-\uFF5E (！～)
+转换: 半角 = 全角 - 0xFEE0
+示例: "ＡＢＣ１２３" → "ABC123"
 ```
 
-**WWW 过滤**:
+**WWW 疑问词过滤** (移除前缀疑问词，保留核心语义):
 ```java
-// 移除对召回无贡献的疑问词
+// 中文疑问词模式
 中文: 什么样|哪家|请问|啥样|咋样了|什么时候|何时|何地|何人|是否|
       是不是|多少|哪里|怎么|哪儿|怎么样|如何|哪些|是啥|啥是|
       吗|呢|吧|咋|什么|有没有|谁|哪位|哪个
-英文: what|who|how|which|where|why|is|are|do|does
+
+// 示例
+"深度学习是啥" → 移除 "啥" → "深度学习是" → 移除 "是" → "深度学习"
+"什么是机器学习" → 移除 "什么是" → "机器学习"
 ```
 
 **同义词查表**:
 ```
-来源: synonym.json (可从 anotherRagProject 复用)
-查询方式: 哈希表 O(1) 查找
-扩展策略: 最多返回 5 个同义词，避免 query 过长
+来源: classpath:dict/synonym.txt (哈希表 O(1) 查找)
+扩展策略: 最多 5 个同义词，避免 Query 过长
+内置默认同义词，无词典也能工作
 ```
 
-##### 验证日志
+#### 2.2.4 验证日志
+
 ```
 [QueryRewriteService] 原始查询: "深度学习框架到底是啥样的啊？"
 [QueryRewriteService] 全角转换: "深度学习框架到底是啥样的啊?"
@@ -203,84 +194,180 @@ public class QueryRewriteService {
 [QueryRewriteService] 最终查询: "深度学习框架 深度学习 学习框架 机器学习框架"
 ```
 
-##### 注意事项
-- 同义词词典路径: `classpath:dict/synonym.txt`
-- 如词典文件不存在，服务降级为纯规则处理（不报错）
-- WWW 过滤是移除前缀疑问词，保留核心语义词
-- 内置默认同义词，无需外部词典也能工作
+#### 2.2.5 配置项
+
+```yaml
+query-rewrite:
+  enabled: true
+  synonym-path: classpath:dict/synonym.txt
+  synonym-enabled: true
+  synonym-max: 5
+  www-filter-enabled: true
+  fullwidth-normalization-enabled: true
+```
+
+#### 2.2.6 为什么不选用其他方案
+
+| 方案 | 原因 |
+|------|------|
+| **HyDE** | 幻觉问题 + 额外 500ms 延迟 |
+| **Multi-Query** | Token 消耗翻倍，仅备选短 Query |
+| **Query Decomposition** | 适合多跳推理，场景不匹配 |
+| **BERT 意图分类** | 需训练数据，简化版备选 |
 
 ---
 
-#### 2.2.5 备选方案：Multi-Query（短 Query 增强）
+### 2.3 MinerU 文档解析增强 ✅
 
-**触发条件**:
-- 查询长度 < 10 个字符
-- 手动关闭同义词扩展
+#### 2.3.1 问题背景
 
-**实现方案**:
+| 解析方式 | 输出格式 | 表格处理 | 图片OCR | 代码解析 |
+|---------|---------|---------|--------|---------|
+| Apache Tika | 纯文本 | ❌ 差 | ❌ 无 | ❌ 无 |
+| MinerU (vlm) | Markdown + JSON | ✅ 保留结构 | ✅ OCR | ✅ 保留 |
+
+#### 2.3.2 技术方案对比
+
+| 方案 | 成本 | 精度 | 部署难度 | 状态 |
+|------|------|------|---------|------|
+| **Apache Tika** | 免费 | 基础 | 简单 | ❌ 原有 |
+| **DeepDoc (Python)** | 免费 | 高 | 复杂 (需 ONNX) | ❌ 未采用 |
+| **MinerU API** | 按量计费 | 高 | 简单 (HTTP API) | ✅ 现有 |
+| **阿里云文档解析** | 按量计费 | 高 | 简单 | ⚠️ 备选 |
+
+#### 2.3.3 现有架构流程
+
+```
+用户上传 PDF
+    │
+    ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ 1. MinIO 存储 (原有流程不变)                                                │
+│    → 分片上传 → 合并 → merged/{md5}                                         │
+│    → 发送 Kafka 消息                                                        │
+└─────────────────────────────────────────────────────────────────────────────┘
+    │
+    ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ 2. FileProcessingConsumer 处理                                              │
+│    → 下载 MinIO 文件到本地临时目录                                           │
+│    → 调用 MinerUService.uploadAndParse()                                   │
+└─────────────────────────────────────────────────────────────────────────────┘
+    │
+    ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ 3. MinerU API 调用流程                                                     │
+│    ┌─────────────────────────────────────────────────────────────────┐     │
+│    │ applyUploadUrl() → 申请上传链接 + batch_id                        │     │
+│    │         ↓                                                         │     │
+│    │ uploadFile() → PUT 上传 PDF 到 MinerU OSS (预签名 URL)             │     │
+│    │         ↓                                                         │     │
+│    │ waitForBatchDone() → 轮询 (最多100次, 每次5秒)                    │     │
+│    │         ↓                                                         │     │
+│    │ downloadAndParseZip() → 下载 ZIP → 解压 full.md/content.json      │     │
+│    └─────────────────────────────────────────────────────────────────┘     │
+└─────────────────────────────────────────────────────────────────────────────┘
+    │
+    ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ 4. 结果处理                                                                 │
+│    → MinerUParseResult 存入 MySQL (mineru_parse_result 表)                 │
+│    → 文本块向量化 → 存入 Elasticsearch                                       │
+│    → 清理本地临时文件                                                       │
+└─────────────────────────────────────────────────────────────────────────────┘
+    │
+    ▼
+降级: MinerU 失败 → 自动降级到 Tika
+```
+
+#### 2.3.4 MinerU 返回文件说明
+
+| 文件 | 内容 | 大小示例 | 用途 |
+|------|------|---------|------|
+| `full.md` | 完整 Markdown | ~3KB | RAG 检索文本来源 |
+| `content_list_v2.json` | 结构化内容列表 | ~26KB | 精细分块、页码追溯 |
+| `layout.json` | 布局信息 | ~82KB | 调试用，不存储 |
+| `*_origin.pdf` | 原始 PDF | ~224KB | ❌ 不存储 (MinIO 已有) |
+
+#### 2.3.5 配置项
+
+```yaml
+MinerU:
+  enabled: true                                         # 启用 MinerU
+  api-url: https://mineru.net
+  api-key: eyJ0eXBl...                                # Token
+  model-version: vlm
+  language: ch
+  enable-table: true                                   # 表格识别
+  enable-formula: true                                 # 公式识别
+  is-ocr: true                                         # 图片 OCR
+  polling-max-attempts: 100
+  polling-interval-ms: 5000
+  timeout-ms: 30000
+  temp-download-path: D:/tmp/mineru                    # Windows 临时目录
+```
+
+#### 2.3.6 端到端验证日志
+
+```
+[MinerU] 开始解析文件: RAG简历.pdf, 大小: 224750 bytes
+[MinerU] 申请上传链接响应状态: 200
+[MinerU] batch_id: 5f732568-9afc-4ae2-aa1f-d2a824104fd4
+[MinerU] 文件上传成功 (HTTP 200)
+[MinerU] 轮询状态: waiting-file → done
+[MinerU] ZIP 下载完成: 239476 bytes
+[MinerU] 提取到 full.md: 2612 bytes
+[MinerU] 提取到 content_list_v2.json: 26319 bytes
+[MinerU] 解析完成，共 12 个文本块
+```
+
+#### 2.3.7 注意事项
+
+1. **YAML 配置结构**：必须使用扁平结构 `api-url`/`api-key`
+2. **Windows 路径**：`temp-download-path` 使用 `D:/tmp/mineru`
+3. **降级机制**：MinerU 失败时自动降级到 Tika
+4. **文件清理**：解析完成后删除本地临时文件
+
+---
+
+## 三、待优化项
+
+### 3.1 对话记忆摘要 (中优先级)
+
+**现状**：
+- Redis 存储，TTL 7天，限制 20 条（简单截断）
+- 长对话会溢出上下文窗口
+
+**优化方案**：
 ```java
-public List<String> generateMultiQueries(String query) {
-    // 调用 LLM 生成 2-3 条相似查询
-    // 例如: "深度学习" → ["深度学习框架有哪些", "常用的深度学习框架", "深度学习框架对比"]
-    // 并行召回后用 RRF 融合
+@Service
+public class ConversationMemoryService {
+    // 对话超过 N 轮时，调用 LLM 摘要历史
+    // 保留关键实体、问题模式、决策结论
+    // 替换超长历史为: 摘要 + 关键点列表
 }
 ```
 
-**面试官想听的知识点：**
-> "Multi-Query 会增加 token 消耗，所以我在配置中设置了上限（最多 3 条）。只在短 Query 时触发，因为这时候语义信息不足，规则 expansion 效果有限。"
+**预期效果**：
+- 上下文窗口利用率提升 50%
+- 长时间对话质量稳定
 
 ---
 
-#### 2.2.6 简历更新对照
+### 3.2 MCP 协议 + Agent 架构 (中优先级)
 
-| 简历描述 | 实际实现 | 说明 |
-|----------|----------|------|
-| **基于规则实现查询改写** | ✅ 已实现 | 全角转半角、WWW 过滤、同义词扩展 |
-| **BERT 分类器实现意图识别** | ⚠️ 简化版 | 规则判断意图类型，不使用 BERT |
-| **对口语化、错别字进行重写** | ✅ 已实现 | 正则错别字纠正 + 口语词过滤 |
-| **短 Query 扩写** | ⚠️ 备选 | Multi-Query 为备选方案 |
-| **HyDE 生成假设文档** | ❌ 未实现 | 幻觉问题 + 额外延迟风险 |
+**现状**：
+- 仅有单轮问答能力
+- 无法调用外部工具（查天气、读文件等）
 
-**简历描述修正建议**:
-> "基于规则引擎实现查询改写：全角转半角规范化、WWW 疑问词过滤、同义词哈希表扩展，对口语化输入和短 Query 进行语义增强。"
-
----
-
-### 2.3 文档解析增强 (MinerU/DeepDoc 级别) (低优先级)
-
-**现状对比**:
-- anotherRagProject: DeepDoc (YOLO layout detection, Table Structure Recognition, CRNN OCR, XGBoost 纵向拼接)
-- PaiSmart: Apache Tika (基础文本提取，无视觉模型)
-
-**可行性**: `low`
-- DeepDoc 依赖大量 Python ML 模型 (ONNX)
-- 需要完全重写或引入 Python 服务
-- 改动量极大
-
-**可选方案**:
-1. **引入 Python 微服务**: DeepDoc 作为独立解析服务，PaiSmart 通过 HTTP 调用
-2. **使用阿里云/腾讯云文档解析 API**: 商业方案，开箱即用
-3. **仅增强 Tika**: 增加 PDF 标题/表格检测规则 (有限提升)
-
----
-
-### 2.4 MCP 协议 + Agent 架构 (中优先级)
-
-**现状对比**:
-- 两项目均未实现
-- anotherRagProject: 无 Agent
-- PaiSmart: 无 MCP
-
-**可行性**: `medium-high` (针对 Spring AI)
-- Spring AI FunctionCallback 已支持 MCP-like tool calling
-- 需要设计工具 schema (文件读取、PDF生成、数据库查询)
-- ReAct 推理循环需自行实现
-
-**迁移方案**:
+**优化方案**：
 ```java
 // 1. 定义工具接口
 @Tool(name = "file_reader", description = "读取本地文件内容")
 String readFile(@ToolParam("path") String path);
+
+@Tool(name = "search_web", description = "搜索网页内容")
+String searchWeb(@ToolParam("query") String query);
 
 // 2. 实现 ReAct Agent
 @Service
@@ -292,155 +379,92 @@ public class ReActAgent {
 
 ---
 
-### 2.5 对话记忆摘要 (中优先级)
+### 3.3 RAG 评测框架 (低优先级)
 
-**现状对比**:
-- PaiSmart: Redis 存储，TTL 7天，限制20条 (简单截断)
-- anotherRagProject: 未详查
+**现状**：仅有用量统计，无效果评测
 
-**可行性**: `high`
-- 已有 Redis 基础设施
-- 可调用 LLM API 做摘要压缩
-- 实现方式成熟
-
-**迁移方案**:
+**优化方案**：
 ```java
-@Service
-public class ConversationMemoryService {
-    // 当对话超过 N 轮时，调用 LLM 摘要历史
-    // 保留关键实体和问题模式
-    // 替换超长历史为摘要 + 关键点
-}
-```
-
----
-
-### 2.6 RAG 评测框架 (低优先级)
-
-**现状**: 完全缺失，仅有用量统计
-
-**可行性**: `medium`
-- 需要标注测试集 (简历中提到 2000 条 QA)
-- 可计算 Recall@K, MRR, NDCG, F1
-- 需持久化评测结果
-
-**迁移方案**:
-```java
-// 1. 评测数据集 entity
+// 1. 评测数据集
 @Entity
 public class EvalDataset {
-    Long id;
     String query;           // 用户问题
-    String groundTruth;    // 标准答案 chunk
-    List<String> relChIds; // 相关 chunk IDs
+    String groundTruth;     // 标准答案
+    List<String> relDocIds; // 相关文档 ID
 }
 
-// 2. 评测服务
-@Service
-public class RagEvalService {
-    // 对每条 query 执行 RAG 流程
-    // 计算 Recall@K, MRR, NDCG
-    // 输出评测报告
-}
+// 2. 评测指标
+// Recall@K, MRR@K, NDCG@K, F1@K
+
+// 3. 评测流程
+// 定期运行评测集 → 生成报告 → 持续监控优化效果
 ```
 
 ---
 
-## 三、优先级排序与实施计划
+## 四、文件变更清单
 
-### Phase 1: 检索效果增强 ✅ RRF+Rerank 已完成
-1. ~~**Query Rewrite Service** - 查询预处理~~ - 待实现
-2. ✅ **RRF + Rerank 二阶段重排** - 已实现
-3. **混合搜索优化** - 调整 KNN/BM25 权重 - RRF 替代
+### 4.1 已修改文件
 
-### Phase 2: 对话质量优化 (1 周)
-4. **对话记忆摘要** - 解决长对话上下文溢出
-5. **流式响应优化** - 改善用户体验
+| 文件 | 变更类型 | 说明 |
+|------|---------|------|
+| `service/HybridSearchService.java` | 重写 | RRF + Rerank 两阶段排序 |
+| `service/QueryRewriteService.java` | 新增 | 查询改写服务 |
+| `service/ElasticsearchService.java` | 修改 | deleteByFileMd5 返回删除数量 |
+| `consumer/FileProcessingConsumer.java` | 修改 | MinerU 解析分支 + 降级逻辑 |
+| `model/FileUpload.java` | 修改 | 添加解析状态字段 |
+| `application.yml` | 修改 | MinerU/Rerank/QueryRewrite 配置 |
+| `frontend/src/enum/index.ts` | 修改 | ParseStatus 枚举 |
 
-### Phase 3: 高级特性 (2-4 周)
-6. **MCP + Agent 架构** - 工具调用 + ReAct
-7. **文档解析增强** - 如需要可引入 Python 解析服务
+### 4.2 新增文件
 
-### Phase 4: 工程化 (1 周)
-8. **RAG 评测框架** - 量化优化效果
-
----
-
-## 四、风险与依赖
-
-| 项目 | 风险 | 依赖 |
-|------|------|------|
-| Rerank | 阿里云 API 费用 | `qwen-rerank` API Key |
-| Query Rewrite | 同义词词典质量 | 需要标注或复用 anotherRagProject 词典 |
-| Agent/MCP | 实现复杂度高 | Spring AI 学习成本 |
-| 文档解析 | 工作量极大 | 可能需要独立解析服务 |
+| 文件 | 说明 |
+|------|------|
+| `config/RerankProperties.java` | Rerank 配置类 |
+| `client/RerankClient.java` | DashScope qwen-rerank API 客户端 |
+| `config/MinerUProperties.java` | MinerU 配置类 |
+| `service/MinerUService.java` | MinerU API 服务 |
+| `model/MinerUParseResult.java` | MinerU 解析结果实体 |
+| `repository/MinerUParseResultRepository.java` | MinerU 数据访问 |
+| `test/MinerUApiDemo.java` | MinerU API 验证 Demo |
+| `dict/synonym.txt` | 同义词词典 |
 
 ---
 
-## 五、建议
+## 五、技术债务与风险
 
-**已完成**:
-1. ✅ RRF + Cross-Encoder 二阶段重排 - 已实现并通过代码验证
-2. ✅ MinerU 集成 - 核心代码已完成，待测试验证
-
-**立即可行 (已验证)**:
-3. Query Rewrite - 纯 Java/规则实现，风险低
-4. Rerank - 阿里云商业 API，即开即用
-
-**需评估**:
-5. Agent/MCP - 取决于产品需求是否需要多工具编排
-
-**暂不推荐**:
-6. DeepDoc 级别解析 - 投入产出比低，建议用云解析 API 替代
+| 项目 | 风险 | 缓解措施 |
+|------|------|---------|
+| MinerU API 费用 | 按量计费，无上限 | 设置每日调用配额监控 |
+| MinerU 服务不可用 | 依赖外部 API | 降级到 Tika 已实现 |
+| Rerank API 费用 | qwen-rerank 按次计费 | RRF 结果可回退 |
+| 同义词词典质量 | 覆盖有限 | 内置默认同义词 |
+| 长对话上下文溢出 | Redis 截断丢失信息 | 待实现摘要策略 |
 
 ---
 
-## 六、MinerU 集成 (已完成核心实现)
+## 六、配置参考
 
-### 6.1 实现状态
+### 6.1 环境变量
 
-| 组件 | 状态 | 文件 |
-|------|------|------|
-| MinerUProperties 配置类 | ✅ 已完成 | `config/MinerUProperties.java` |
-| MinerUService 服务 | ✅ 已完成 | `service/MinerUService.java` |
-| MinerUParseResultEntity | ✅ 已完成 | `model/MinerUParseResult.java` |
-| MinerUParseResultRepository | ✅ 已完成 | `repository/MinerUParseResultRepository.java` |
-| FileProcessingConsumer 集成 | ✅ 已完成 | `consumer/FileProcessingConsumer.java` |
-| FileUpload 解析状态字段 | ✅ 已完成 | `model/FileUpload.java` |
-| application.yml 配置 | ✅ 已完成 | `resources/application.yml` |
-| 前端 ParseStatus 枚举 | ✅ 已完成 | `frontend/src/enum/index.ts` |
+```bash
+# 必须配置
+export MINERU_TOKEN="your-mineru-token"
+export EMBEDDING_API_KEY="your-aliyun-key"  # 通义千问 API Key
 
-### 6.2 配置说明
-
-```yaml
-MinerU:
-  enabled: false  # 设为 true 启用 MinerU 解析
-  api:
-    url: https://mineru.net
-    key: ${MINERU_TOKEN}  # 从环境变量或配置文件读取
-  model-version: vlm
-  language: ch
-  enable-table: true
-  enable-formula: true
-  is-ocr: true
-  polling-max-attempts: 100
-  polling-interval-ms: 5000
+# 可选配置
+export ELASTIC_PASSWORD="PaiSmart2025"
 ```
 
-### 6.3 流程说明
+### 6.2 关键端口
 
-1. **启用 MinerU**: 将 `mineru.enabled` 设为 `true`
-2. **文件上传**: 保持现有流程 (MinIO)
-3. **Kafka 消息**: 保持现有流程
-4. **Consumer 处理**:
-   - 如果 `minerU.enabled=true`: 调用 MinerU API 解析
-   - 如果 `minerU.enabled=false` 或 MinerU 失败: 降级到 Tika
-5. **结果存储**:
-   - `full.md` 和 `content_list_v2.json` 存入 `mineru_parse_result` 表
-   - 文本块存入 Elasticsearch (复用现有逻辑)
-
-### 6.4 待完成
-
-1. **前端解析状态显示**: 需要 API 返回 `parseStatus` 后端支持
-2. **端到端测试**: 启用 `minerU.enabled=true` 后测试完整流程
-3. **错误处理优化**: 根据实际运行情况调整降级策略
+| 服务 | 端口 | 说明 |
+|------|------|------|
+| MySQL | 3306 | 元数据存储 |
+| Redis | 6379 | 缓存 + 会话 |
+| Kafka | 9092 | 消息队列 |
+| Elasticsearch | 9200 | 向量 + 全文检索 |
+| MinIO API | 19000 | 对象存储 |
+| MinIO Console | 19001 | 管理界面 |
+| Spring Boot | 8081 | 后端服务 |
+| Vue Frontend | 9527 | 前端服务 |

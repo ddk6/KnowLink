@@ -111,10 +111,9 @@ deepseek:
     key:   sk-e3b9af5e5bd944c99c46b6bd9c0733f6 # DeepSeek API Key 如果是本地就为空
 
 MinerU:
-  enabled: false                                        # 是否启用 MinerU 解析 (false 则使用原有 Tika)
-  api:
-    url: https://mineru.net                             # MinerU API 地址
-    key: eyJ0eXBlIjoiSldUIiwiYWxnIjoiSFM1MTIifQ.eyJqdGkiOiIxNTgwMDE3MSIsInJvbCI6IlJPTEVfUkVHSVNURVIiLCJpc3MiOiJPcGVuWExhYiIsImlhdCI6MTc3NTk3MTgxMiwiY2xpZW50SWQiOiJsa3pkeDU3bnZ5MjJqa3BxOXgydyIsInBob25lIjoiMTU1NjMyOTg1NDYiLCJvcGVuSWQiOm51bGwsInV1aWQiOiIwODU0NTA2ZC1hYThkLTRjMzYtYTBlMC05OTkyOWE0NmRmN2QiLCJlbWFpbCI6IiIsImV4cCI6MTc4Mzc0NzgxMn0.-ndyQLXlWPhh3fQS6Ddg_jkOcWwnvYwLlgBdSfII0qkmgln-yWix_0tNHywR7lWngPsryk2o2Lr3uhK4qLEMKw
+  enabled: true                                        # 是否启用 MinerU 解析 (false 则使用原有 Tika)
+  api-url: https://mineru.net                           # MinerU API 地址
+  api-key: eyJ0eXBlIjoiSldUIiwiYWxnIjoiSFM1MTIifQ.eyJqdGkiOiIxNTgwMDE3MSIsInJvbCI6IlJPTEVfUkVHSVNURVIiLCJpc3MiOiJPcGVuWExhYiIsImlhdCI6MTc3NTk3MTgxMiwiY2xpZW50SWQiOiJsa3pkeDU3bnZ5MjJqa3BxOXgydyIsInBob25lIjoiMTU1NjMyOTg1NDYiLCJvcGVuSWQiOm51bGwsInV1aWQiOiIwODU0NTA2ZC1hYThkLTRjMzYtYTBlMC05OTkyOWE0NmRmN2QiLCJlbWFpbCI6IiIsImV4cCI6MTc4Mzc0NzgxMn0.-ndyQLXlWPhh3fQS6Ddg_jkOcWwnvYwLlgBdSfII0qkmgln-yWix_0tNHywR7lWngPsryk2o2Lr3uhK4qLEMKw
   model-version: vlm                                    # MinerU 模型版本
   language: ch                                           # 语言设置
   enable-table: true                                     # 是否启用表格识别
@@ -123,7 +122,7 @@ MinerU:
   polling-max-attempts: 100                             # 轮询最大次数
   polling-interval-ms: 5000                             # 轮询间隔 (毫秒)
   timeout-ms: 30000                                     # 请求超时 (毫秒)
-  temp-download-path: /tmp/mineru                       # 临时下载目录
+  temp-download-path: D:/tmp/mineru                       # 临时下载目录 (Windows路径)
 
 embedding:
   api:

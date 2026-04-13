@@ -99,8 +99,8 @@ public class DocumentService {
             
             // 1. 删除Elasticsearch中的数据
             try {
-                elasticsearchService.deleteByFileMd5(fileMd5);
-                logger.info("成功从Elasticsearch删除文档: {}", fileMd5);
+                long deletedCount = elasticsearchService.deleteByFileMd5(fileMd5);
+                logger.info("成功从Elasticsearch删除文档: {}, 删除了 {} 条", fileMd5, deletedCount);
             } catch (Exception e) {
                 logger.error("从Elasticsearch删除文档时出错: {}", fileMd5, e);
                 // 继续删除其他数据

@@ -72,15 +72,20 @@ public class ElasticsearchService {
     /**
      * 根据file_md5删除文档
      * @param fileMd5 文件指纹
+     * @return 删除的文档数量
      */
-    public void deleteByFileMd5(String fileMd5) {
+    public long deleteByFileMd5(String fileMd5) {
         try {
             DeleteByQueryRequest request = DeleteByQueryRequest.of(d -> d
                     .index("knowledge_base")
                     .query(q -> q.term(t -> t.field("fileMd5").value(fileMd5)))
             );
-            esClient.deleteByQuery(request);
+            var response = esClient.deleteByQuery(request);
+            long deleted = response.deleted();
+            logger.info("从Elasticsearch删除文档: fileMd5={}, 删除数量={}", fileMd5, deleted);
+            return deleted;
         } catch (Exception e) {
+            logger.error("从Elasticsearch删除文档失败: fileMd5={}", fileMd5, e);
             throw new RuntimeException("删除文档失败", e);
         }
     }
