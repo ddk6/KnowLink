@@ -52,4 +52,28 @@ public class DocumentVector {
      */
     @Column(name = "is_public", nullable = false)
     private boolean isPublic = false;
+
+    /**
+     * 层级路径，如 "第3条 > 3.2 > (1)"
+     */
+    @Column(name = "section_path", length = 500)
+    private String sectionPath;
+
+    /**
+     * chunk 类型: text/table/list
+     */
+    @Column(name = "chunk_type", length = 20)
+    private String chunkType;
+
+    /**
+     * 是否关键条款
+     */
+    @Column(name = "is_key_clause")
+    private boolean isKeyClause = false;
+
+    /**
+     * chunk token 数
+     */
+    @Column(name = "token_count")
+    private Integer tokenCount;
 }

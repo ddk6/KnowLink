@@ -22,6 +22,12 @@ public class EsDocument {
     private String orgTag;         // 组织标签
     private boolean isPublic;      // 是否公开
 
+    // V3 增强字段
+    private String sectionPath;     // 层级路径，如 "第3条 > 3.2 > (1)"
+    private String chunkType;       // text/table/list
+    private boolean isKeyClause;   // 是否关键条款
+    private Integer tokenCount;     // token 数
+
     /**
      * 默认构造函数，用于Jackson反序列化
      */
@@ -33,7 +39,7 @@ public class EsDocument {
      */
     public EsDocument(String id, String fileMd5, int chunkId, String content,
                      Integer pageNumber, String anchorText,
-                     float[] vector, String modelVersion, 
+                     float[] vector, String modelVersion,
                      String userId, String orgTag, boolean isPublic) {
         this.id = id;
         this.fileMd5 = fileMd5;
@@ -46,7 +52,33 @@ public class EsDocument {
         this.userId = userId;
         this.orgTag = orgTag;
         this.isPublic = isPublic;
+        this.chunkType = "text";
+        this.isKeyClause = false;
     }
-    
+
+    /**
+     * 完整构造函数，包含 V3 增强字段
+     */
+    public EsDocument(String id, String fileMd5, int chunkId, String content,
+                     Integer pageNumber, String anchorText,
+                     float[] vector, String modelVersion,
+                     String userId, String orgTag, boolean isPublic,
+                     String sectionPath, String chunkType, boolean isKeyClause, Integer tokenCount) {
+        this.id = id;
+        this.fileMd5 = fileMd5;
+        this.chunkId = chunkId;
+        this.textContent = content;
+        this.pageNumber = pageNumber;
+        this.anchorText = anchorText;
+        this.vector = vector;
+        this.modelVersion = modelVersion;
+        this.userId = userId;
+        this.orgTag = orgTag;
+        this.isPublic = isPublic;
+        this.sectionPath = sectionPath;
+        this.chunkType = chunkType != null ? chunkType : "text";
+        this.isKeyClause = isKeyClause;
+        this.tokenCount = tokenCount;
+    }
 
 }

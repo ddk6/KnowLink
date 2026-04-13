@@ -101,4 +101,23 @@ public class ElasticsearchService {
             throw new RuntimeException("统计文档失败", e);
         }
     }
+
+    /**
+     * 删除知识库所有文档
+     */
+    public long deleteAllDocuments() {
+        try {
+            DeleteByQueryRequest request = DeleteByQueryRequest.of(d -> d
+                    .index("knowledge_base")
+                    .query(q -> q.matchAll(m -> m))
+            );
+            var response = esClient.deleteByQuery(request);
+            long deleted = response.deleted();
+            logger.info("清空 Elasticsearch knowledge_base 索引，删除数量={}", deleted);
+            return deleted;
+        } catch (Exception e) {
+            logger.error("清空 Elasticsearch 失败", e);
+            throw new RuntimeException("清空 ES 失败", e);
+        }
+    }
 }

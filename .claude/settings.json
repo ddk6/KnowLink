@@ -15,7 +15,25 @@
       "Bash(/d/soft/IDEA/plugins/maven/lib/maven3/bin/mvn.cmd compile:*)",
       "Bash(curl -s \"http://localhost:9200/knowledge_base/_search?size=10\" -H \"Content-Type: application/json\")",
       "Bash(curl -s -u elastic:PaiSmart2025 \"http://localhost:9200/knowledge_base/_search?size=10\" -H \"Content-Type: application/json\")",
-      "Bash(curl -s -u elastic:PaiSmart2025 \"http://localhost:9200/_cat/indices?v\")"
+      "Bash(curl -s -u elastic:PaiSmart2025 \"http://localhost:9200/_cat/indices?v\")",
+      "Read(//d/tmp/mineru/download/result/**)",
+      "Read(//d/tmp/mineru/**)",
+      "Bash(dir \"D:\\\\tmp\\\\mineru\" /b)",
+      "Bash(cmd.exe /c \"mvn compile -q\")",
+      "Bash(D:/soft/apache-maven-3.9.6/bin/mvn.cmd compile:*)",
+      "Bash(cmd.exe /c \"mvn compile -q 2>&1\")",
+      "Bash(curl -s -X POST \"http://localhost:9200/knowledge_base/_delete_by_query\" -H 'Content-Type: application/json' -d '{\"query\":{\"term\":{\"fileMd5\":\"0b8415eb60483eb5264f4086c6b71be6\"}}}')",
+      "Bash(curl -s -u elastic:PaiSmart2025 -X POST \"http://localhost:9200/knowledge_base/_delete_by_query\" -H 'Content-Type: application/json' -d '{\"query\":{\"term\":{\"fileMd5\":\"0b8415eb60483eb5264f4086c6b71be6\"}}}')",
+      "Bash(curl -s -u elastic:PaiSmart2025 \"http://localhost:9200/knowledge_base/_search?size=5&_source=fileMd5,textContent\")",
+      "Bash(python3 -m json.tool)",
+      "Bash(curl -s -u elastic:PaiSmart2025 \"http://localhost:9200/knowledge_base/_search?size=5\")",
+      "Bash(curl -s -u elastic:PaiSmart2025 -X DELETE \"http://localhost:9200/knowledge_base\")",
+      "Bash(curl -s -X POST \"http://localhost:6379/flushall\")",
+      "Bash(curl -s -X POST \"http://localhost:6379/FLUSHALL\")",
+      "Bash(curl -X POST \"localhost:9200/knowledge_base/_delete_by_query\" -H \"Content-Type: application/json\" -d '{\"query\": {\"match_all\": {}}}')",
+      "Bash(redis-cli -a PaiSmart2025 FLUSHALL)",
+      "Bash(where redis-cli:*)",
+      "Bash(curl -X POST localhost:9200/knowledge_base/_delete_by_query -u elastic:PaiSmart2025 -H 'Content-Type: application/json' -d '{\"query\": {\"match_all\": {}}}')"
     ]
   }
 }

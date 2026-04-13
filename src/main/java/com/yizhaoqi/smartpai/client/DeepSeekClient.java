@@ -247,4 +247,54 @@ public class DeepSeekClient {
             this.estimatedPromptTokens = estimatedPromptTokens;
         }
     }
+
+    /**
+     * 同步调用 LLM（用于表格分类等不需要流式的场景）
+     *
+     * @param userMessage 用户消息
+     * @param systemPrompt 系统提示（可选）
+     * @return LLM 响应内容
+     */
+    public String callSync(String userMessage, String systemPrompt) {
+        List<Map<String, String>> messages = new ArrayList<>();
+
+        if (systemPrompt != null && !systemPrompt.isBlank()) {
+            messages.add(Map.of("role", "system", "content", systemPrompt));
+        }
+        messages.add(Map.of("role", "user", "content", userMessage));
+
+        Map<String, Object> request = new java.util.HashMap<>();
+        request.put("model", model);
+        request.put("messages", messages);
+        request.put("stream", false);
+
+        try {
+            String response = webClient.post()
+                    .uri("/chat/completions")
+                    .contentType(MediaType.APPLICATION_JSON)
+                    .bodyValue(request)
+                    .retrieve()
+                    .bodyToMono(String.class)
+                    .block();
+
+            // 解析响应
+            JsonNode root = objectMapper.readTree(response);
+            return root.path("choices")
+                    .path(0)
+                    .path("message")
+                    .path("content")
+                    .asText("");
+
+        } catch (Exception e) {
+            logger.error("DeepSeek 同步调用失败: {}", e.getMessage());
+            throw new RuntimeException("LLM 调用失败: " + e.getMessage(), e);
+        }
+    }
+
+    /**
+     * 同步调用 LLM（使用默认系统提示）
+     */
+    public String callSync(String userMessage) {
+        return callSync(userMessage, null);
+    }
 }

@@ -79,7 +79,7 @@ public class MinerUApiDemo {
 
         // ========== 测试 1: 上传本地文件 ==========
         System.out.println("\n========== 测试 1: 本地文件上传解析 ==========");
-        Path pdfFile = Path.of("d:/Project/PaiSmart-main/anotherRagProject/RAG简历.pdf");
+        Path pdfFile = Path.of("D:\\Project\\PaiSmart-main\\anotherRagProject\\FinInsRAG-V3\\swxy(1)\\swxy\\【兴证电子】世运电路2023中报点评.pdf");
 
         if (!Files.exists(pdfFile)) {
             System.err.println("PDF 文件不存在: " + pdfFile);

@@ -1,6 +1,6 @@
 # PaiSmart 功能增强技术手册
 
-> 本文档记录 PaiSmart 项目各项功能优化的**演进历程、技术方案对比、现有架构和未来规划**。
+> 本文档记录 PaiSmart 项目各项功能优化的**技术演进历程、架构决策与实现细节**。
 
 ---
 
@@ -34,27 +34,143 @@
 | 环节 | 原有方案 | 现有方案 | 状态 |
 |------|---------|---------|------|
 | **文档解析** | Apache Tika (纯文本) | MinerU (Markdown+JSON) | ✅ 已优化 |
-| **文本分块** | 512字符固定切分 | 512字符 + 语义边界 + 句子分割 | ⚠️ 部分优化 |
-| **文档结构识别** | 无 | MinerU 保留标题 | ⚠️ 待增强 |
-| **表格处理** | 无感知 | MinerU 返回 JSON | ⚠️ 待增强 |
+| **文本分块** | 512字符固定切分 | V3 语义感知切分（标题/表格/列表结构化） | ✅ 已实现 |
+| **文档结构识别** | 无 | MinerU content_list_v2.json 结构化识别 | ✅ 已实现 |
+| **表格处理** | 无感知 | V3 表格切分（小表格整体，大表格按行+表头） | ✅ 已实现 |
+| **列表前导句** | 无 | V3 前导句+列表项合并，过长拆分保留前导句 | ✅ 已实现 |
 | **查询预处理** | 无 | 规则 Query Rewrite | ✅ 已实现 |
 | **向量召回** | KNN only | RRF 融合 (KNN+BM25) | ✅ 已优化 |
 | **重排序** | 无 | Cross-Encoder (qwen-rerank) | ✅ 已实现 |
 
 ---
 
-## 二、已完成的优化
+## 二、文档解析技术选型
 
-### 2.1 RRF + Cross-Encoder 二阶段重排 ✅
+### 2.1 技术方案对比
 
-#### 2.1.1 问题背景
+| 方案 | 输出格式 | 表格处理 | 图片OCR | 部署难度 | 状态 |
+|------|---------|---------|--------|---------|------|
+| **Apache Tika** | 纯文本 | ❌ 无结构 | ❌ 无 | 简单 | ⚠️ 备选降级 |
+| **MinerU API** | Markdown + JSON | ✅ 结构化保留 | ✅ OCR | 简单 (HTTP) | ✅ 现有 |
+
+**选型结论**：采用 MinerU API 作为主要解析方案，Tika 作为降级备选。
+
+**决策理由**：
+- Tika 输出纯文本，表格结构丢失，无法支持语义级别的表格切分
+- MinerU 返回 `content_list_v2.json`，包含类型、位置、内容等结构化信息
+- API 方式部署简单，无需额外部署 Python 服务或 ONNX 模型
+- MinerU 失败时自动降级到 Tika，保证解析链路的可靠性
+
+**为什么不选其他方案**：
+
+| 方案 | 淘汰原因 |
+|------|---------|
+| DeepDoc (Python+ONNX) | 部署复杂，需额外部署 Python 微服务；ONNX 模型推理增加运维负担 |
+| 阿里云文档解析 | 成本较高；MinerU 已满足当前需求 |
+| 自研解析模型 | 成本高，周期长，当前阶段不划算 |
+
+---
+
+### 2.2 MinerU 集成架构
+
+```
+用户上传 PDF
+    │
+    ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ 1. MinIO 存储 (原有流程不变)                                                │
+│    → 分片上传 → 合并 → merged/{md5}                                         │
+│    → 发送 Kafka 消息                                                        │
+└─────────────────────────────────────────────────────────────────────────────┘
+    │
+    ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ 2. FileProcessingConsumer 处理                                              │
+│    → 下载 MinIO 文件到本地临时目录                                           │
+│    → 调用 MinerUService.uploadAndParse()                                   │
+└─────────────────────────────────────────────────────────────────────────────┘
+    │
+    ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ 3. MinerU API 调用流程                                                     │
+│    ┌─────────────────────────────────────────────────────────────────┐     │
+│    │ applyUploadUrl() → 申请上传链接 + batch_id                        │     │
+│    │         ↓                                                         │     │
+│    │ uploadFile() → PUT 上传 PDF 到 MinerU OSS (预签名 URL)             │     │
+│    │         ↓                                                         │     │
+│    │ waitForBatchDone() → 轮询 (最多100次, 每次5秒)                    │     │
+│    │         ↓                                                         │     │
+│    │ downloadAndParseZip() → 下载 ZIP → 解压 full.md/content.json      │     │
+│    └─────────────────────────────────────────────────────────────────┘     │
+└─────────────────────────────────────────────────────────────────────────────┘
+    │
+    ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ 4. 结果处理                                                                 │
+│    → MinerUParseResult 存入 MySQL                                          │
+│    → 文本块向量化 → 存入 Elasticsearch                                       │
+│    → 清理本地临时文件                                                       │
+└─────────────────────────────────────────────────────────────────────────────┘
+    │
+    ▼
+降级: MinerU 失败 → 自动降级到 Tika
+```
+
+### 2.3 MinerU 返回文件说明
+
+| 文件 | 内容 | 用途 |
+|------|------|------|
+| `full.md` | 完整 Markdown | RAG 检索文本来源 |
+| `content_list_v2.json` | 结构化内容列表 | 精细分块、页码追溯 |
+| `layout.json` | 布局信息 | 调试用，不存储 |
+| `*_origin.pdf` | 原始 PDF | ❌ 不存储 (MinIO 已有) |
+
+### 2.4 MinerU 配置项
+
+```yaml
+MinerU:
+  enabled: true
+  api-url: https://mineru.net
+  api-key: ${MINERU_TOKEN:}
+  model-version: vlm
+  language: ch
+  enable-table: true
+  enable-formula: true
+  is-ocr: false
+  polling-max-attempts: 100
+  polling-interval-ms: 5000
+  timeout-ms: 30000
+  temp-download-path: D:/tmp/mineru
+```
+
+### 2.5 端到端验证日志
+
+```
+[MinerU] 开始解析文件: RAG简历.pdf, 大小: 224750 bytes
+[MinerU] 申请上传链接响应状态: 200
+[MinerU] batch_id: 5f732568-9afc-4ae2-aa1f-d2a824104fd4
+[MinerU] 文件上传成功 (HTTP 200)
+[MinerU] 轮询状态: waiting-file → done
+[MinerU] ZIP 下载完成: 239476 bytes
+[MinerU] 提取到 full.md: 2612 bytes
+[MinerU] 提取到 content_list_v2.json: 26319 bytes
+[MinerU] 解析完成，共 12 个文本块
+```
+
+---
+
+## 三、查询优化技术方案
+
+### 3.1 RRF + Cross-Encoder 二阶段重排
+
+#### 3.1.1 问题背景
 
 **原有方案的问题**：
 - 仅使用 KNN 向量召回，召回结果与关键词相关性弱
 - 无重排序阶段，Top-K 结果质量不稳定
 - BM25 单独使用效果差，未与向量召回融合
 
-#### 2.1.2 技术方案对比
+#### 3.1.2 技术方案对比
 
 | 方案 | 原理 | 优点 | 缺点 | 状态 |
 |------|------|------|------|------|
@@ -63,7 +179,7 @@
 | **RRF 融合** | KNN+BM25 排名加权 | 两路互补 | 需要调参 | ✅ 现有 |
 | **RRF + Rerank** | 融合后 Cross-Encoder 重排 | 精准度最高 | 额外 API 费用 | ✅ 现有 |
 
-#### 2.1.3 现有架构流程
+#### 3.1.3 现有架构流程
 
 ```
 用户查询
@@ -102,7 +218,7 @@
 返回结果给用户
 ```
 
-#### 2.1.4 关键配置
+#### 3.1.4 关键配置
 
 ```yaml
 rerank:
@@ -110,15 +226,15 @@ rerank:
   api-url: https://dashscope.aliyuncs.com/api/v1/services/rerank/text-rerank/text-rerank
   api-key: ${EMBEDDING_API_KEY:}
   model: qwen3-rerank
-  knn-weight: 0.5              # KNN 召回权重
-  bm25-weight: 0.5             # BM25 召回权重
-  rrf-k: 60                    # RRF k 参数，缓解排名差距
-  rerank-top-n: 20             # 重排候选数量
+  knn-weight: 0.5
+  bm25-weight: 0.5
+  rrf-k: 60
+  rerank-top-n: 20
   max-rerank-docs: 100
   timeout-ms: 30000
 ```
 
-#### 2.1.5 验证日志
+#### 3.1.5 验证日志
 
 ```
 [HybridSearchService] 用户查询: "深度学习框架"
@@ -130,7 +246,7 @@ rerank:
 [HybridSearchService] 返回最终搜索结果数量: 5
 ```
 
-#### 2.1.6 回退机制
+#### 3.1.6 回退机制
 
 ```
 Rerank API 失败 → 回退到 RRF 融合结果
@@ -140,16 +256,16 @@ RRF 结果为空 → 回退到纯 BM25 搜索
 
 ---
 
-### 2.2 查询改写与同义词扩展 ✅
+### 3.2 查询改写与同义词扩展
 
-#### 2.2.1 问题背景
+#### 3.2.1 问题背景
 
 **原有方案的问题**：
 - 用户输入全角字符无法匹配（如 "ＡＢＣ" vs "ABC"）
 - 用户使用口语化疑问词影响召回（如 "深度学习是啥" 中的 "啥" 无贡献）
 - 同义词无法扩展（如 "电脑" 和 "计算机" 无法互召回）
 
-#### 2.2.2 优化方案
+#### 3.2.2 优化方案
 
 | 优化项 | 原有 | 优化后 | 效果 |
 |--------|------|--------|------|
@@ -158,7 +274,7 @@ RRF 结果为空 → 回退到纯 BM25 搜索
 | 同义词扩展 | ❌ 无 | ✅ 实现 | "电脑" → "电脑 计算机" |
 | 错别字纠正 | ❌ 无 | ⚠️ 规则实现 | 有限覆盖 |
 
-#### 2.2.3 核心算法
+#### 3.2.3 核心算法
 
 **全角转半角**:
 ```
@@ -186,7 +302,7 @@ RRF 结果为空 → 回退到纯 BM25 搜索
 内置默认同义词，无词典也能工作
 ```
 
-#### 2.2.4 验证日志
+#### 3.2.4 验证日志
 
 ```
 [QueryRewriteService] 原始查询: "深度学习框架到底是啥样的啊？"
@@ -196,7 +312,7 @@ RRF 结果为空 → 回退到纯 BM25 搜索
 [QueryRewriteService] 最终查询: "深度学习框架 深度学习 学习框架 机器学习框架"
 ```
 
-#### 2.2.5 配置项
+#### 3.2.5 配置项
 
 ```yaml
 query-rewrite:
@@ -208,7 +324,7 @@ query-rewrite:
   fullwidth-normalization-enabled: true
 ```
 
-#### 2.2.6 为什么不选用其他方案
+#### 3.2.6 为什么不选用其他方案
 
 | 方案 | 原因 |
 |------|------|
@@ -219,11 +335,9 @@ query-rewrite:
 
 ---
 
-### 2.4 文档切分策略分析 🔍
+## 四、文档切分策略 V3
 
-#### 2.4.1 现状分析
-
-**PaiSmart 现有切分策略**：
+### 4.1 原有方案问题分析
 
 | 解析方式 | 切分依据 | 优点 | 缺点 |
 |---------|---------|------|------|
@@ -232,330 +346,217 @@ query-rewrite:
 | **Tika 超长句子** | HanLP 词法分析 | 中文友好 | 切分可能破坏语义 |
 | **MinerU 解析** | 按 Markdown 标题 `#` | 保留文档结构 | 标题下内容仍按字符切 |
 
-**现有流程**：
-```
-文本输入
-    ↓
-按 \n\n+ 分割段落
-    ↓
-当前 chunk + 段落 ≤ 512?
-    ├── 是 → 添加段落
-    └── 否 → 新建 chunk
-            ↓
-        段落 > 512?
-            ├── 是 → 按句子分割
-            └── 否 → 添加到当前 chunk
-                    ↓
-                句子 > 512?
-                    ├── 是 → HanLP 分词
-                    └── 否 → 添加到 chunk
-```
+**核心问题**：
+1. 表格作为普通文本处理，结构被打断
+2. 列表项在任意位置被切断，语义丢失
+3. 512 字符限制过小，导致 chunk 语义不完整
+4. 未利用 MinerU 返回的 `content_list_v2.json` 结构化信息
 
-#### 2.4.2 对比 anotherRagProject 的 DeepDoc 切分
+### 4.2 V3 语义感知切分方案
 
-| 特性 | PaiSmart (现有) | anotherRagProject (DeepDoc) |
-|------|-----------------|---------------------------|
-| **文档结构识别** | ❌ 无 | ✅ YOLO Layout Detection |
-| **标题感知** | ⚠️ MinerU 保留标题 | ✅ Markdown 标题合并 |
-| **表格处理** | ❌ 无感知 | ✅ Table Structure Recognition |
-| **列表前导句** | ❌ 无 | ✅ `naive_merge` 合并机制 |
-| **递归细切** | ⚠️ 句子级 + 词级 | ✅ Token 级 + 细粒度合并 |
-| **OCR 集成** | ❌ 无 | ✅ CRNN OCR |
-| **切分单位** | 字符数 (512) | Token 数 (128) |
+#### 4.2.1 content_list_v2.json 结构解析
 
-**DeepDoc 切分流程**：
-```
-PDF 输入
-    ↓
-Layout Analysis (YOLO)
-    ↓
-┌────────────────────────────────────────┐
-│  文本区域    表格区域    图片区域        │
-│  (Text)     (Table)    (Image)         │
-└────────────────────────────────────────┘
-    ↓                    ↓
-Table Structure     OCR + Layout
-Recognition (TSR)    Recognition
-    ↓                    ↓
-HTML Table         图片 + 文字
-    ↓
-naive_merge (按 Token 合并)
-    ↓
-tokenize_chunks (添加位置信息)
-```
+MinerU 返回的 `content_list_v2.json` 包含完整的结构化信息：
 
-#### 2.4.3 关键差异详解
-
-**1. 文档结构识别 (Document Structure Recognition)**
-
-PaiSmart: 无结构感知，按固定字符数切分
-```java
-// ParseService.java:500
-String[] paragraphs = text.split("\n\n+");
-```
-
-anotherRagProject: 识别布局结构
-```python
-# DeepDoc Layout Recognition
-self._layouts_rec(zoomin)  # YOLO-based
-self._table_transformer_job(zoomin)  # Table detection
-```
-
-**2. 递归细切 (Recursive Fine-Grained Chunking)**
-
-PaiSmart: 句子 → 词语 两级切分
-```java
-// 句子分割
-String[] sentences = paragraph.split("(?<=[。！？；])|(?<=[.!?;])\\s+");
-// 超长句子用 HanLP 分词
-List<Term> termList = StandardTokenizer.segment(sentence);
-```
-
-anotherRagProject: Token 级细切 + 合并
-```python
-# naive_merge: 按 delimiter 分割后，按 token 数合并
-# chunk_token_num=128 tokens
-def naive_merge(sections, chunk_token_num=128, delimiter="\n!?。；！？"):
-```
-
-**3. 表格表头保留 (Table Header Preservation)**
-
-PaiSmart: 无表格感知
-```java
-// Tika 输出纯文本，表格结构丢失
-// MinerU 返回 content_list_v2.json，但切分时未特殊处理
-```
-
-anotherRagProject: 表格单独处理
-```python
-# tokenize_table: 按行分批处理表格
-for i in range(0, len(rows), batch_size):
-    r = "; ".join(rows[i:i+batch_size])  # 保留行结构
-    d["content_with_weight"] = r
-```
-
-**4. 列表前导句合并 (List Leading Sentence Merging)**
-
-PaiSmart: 无此机制
-```java
-// 列表项被当作普通段落，可能在任意位置切断
-```
-
-anotherRagProject: naive_merge 自动合并
-```python
-# 关键机制：如果 chunk 超过限制，新 chunk 会包含前一个 chunk 的位置信息
-# 位置信息 (pos) 作为列表前导句被合并到下一个 chunk
-if t.find(pos) < 0:
-    t += pos  # 合并前导句
-```
-
-#### 2.4.4 优化建议
-
-**方案 A: 基于 MinerU 的结构化切分 (推荐)**
-
-现状: MinerU 已返回 `content_list_v2.json`，包含结构化信息
 ```json
 {
   "content_list_v2": [
-    {
-      "type": "table",
-      "content": "...",
-      "bbox": {...}
-    },
-    {
-      "type": "text",
-      "content": "...",
-      "heading": "相关工作"
-    }
+    {"type": "title", "level": 1, "content": "第3条 保险责任"},
+    {"type": "table", "content": {...}, "html": "<table>...</table>"},
+    {"type": "list", "lead": "以下情况不在承保范围：", "items": ["(1) 核辐射", "(2) 战争"]},
+    {"type": "text", "content": "正文段落..."}
   ]
 }
 ```
 
-优化方向:
+**V2 Block 类型说明**：
+
+| type | 说明 | content 结构 |
+|------|------|-------------|
+| `paragraph` | 段落 | `contentObj.path("paragraph_content")` |
+| `title` | 标题 | `contentObj.path("title_content")` + `level` |
+| `equation_interline` | 行内公式 | `contentObj.path("equation_interline_content")` |
+| `list` | 列表 | `contentObj.path("list_content")` + `lead` |
+| `table` | 表格 | `contentObj.path("html")` + `table_caption` |
+
+#### 4.2.2 V3 Pipeline 处理流程
+
+```
+原始文档
+   ↓
+结构识别（标题/表格/列表）← 利用 content_list_v2.json
+   ↓
+按 section 粗切（同一 section 内合并，跨 section 不混合）
+   ↓
+超长 section 递归细切（优先按子标题，否则句子级切分）
+   ↓
+表格专项切分（小表格整体，大表格按行+表头）
+   ↓
+列表专项切分（前导句+列表项合并，过长则保留前导句拆分）
+   ↓
+句子级兜底切分
+   ↓
+智能 overlap（100 token base + 扩展到最近句子边界）
+   ↓
+补齐 metadata（section_path, chunk_type, is_key_clause）
+   ↓
+输出最终 chunks
+```
+
+#### 4.2.3 核心切分规则
+
+| 功能 | 实现方式 | chunkSize 规则 |
+|------|---------|---------------|
+| 标题层级识别 | JSON 中 `type: "title"` + `level` 字段 | section 内合并，最大 **1024 token** |
+| 表格处理 | JSON 中 `type: "table"`, 提取 `html` + `table_caption` | **max_size = 300 token**，小表格整体为1个chunk；大表格按行切分，每行 chunk **必须包含前2行表头** |
+| 列表处理 | JSON 中 `type: "list"`, 提取前导句 + items | 前导句+列表项合并为1个chunk；**如果过长可拆分，但每个 chunk 必须保留前导句** |
+| 关键条款 | 标题含"保险责任", "责任免除", "费率", "赔付"关键词 | max_size 可扩大到 **1536 token** |
+| 智能 overlap | 每 chunk 末尾保留 100 token，与下一 chunk 开头重叠 | 扩展到最近句子边界（。！？；）避免截断半句 |
+
+#### 4.2.4 关键条款识别
+
 ```java
-// MinerUService.java 优化
-public List<TextChunk> parseMarkdownWithStructure(String markdown, String contentJson) {
-    // 1. 解析 content_list_v2.json 获取结构信息
-    // 2. 按结构类型分别处理:
-    //    - table: 整表作为一个 chunk 或按行拆分
-    //    - text: 按标题分块，标题作为 prefix
-    // 3. 确保表格不被切断
-}
+List<String> KEY_CLAUSE_KEYWORDS = Arrays.asList(
+    "保险责任", "责任免除", "费率", "赔付", "赔偿", "免责", "承保范围"
+);
 ```
 
-**方案 B: 增强 Tika 的表格感知**
+#### 4.2.5 表格切分实现
 
-优化方向:
 ```java
-// 在 ParseService 中添加表格检测
-private List<String> detectTables(String text) {
-    // 检测 markdown 表格格式 | col1 | col2 |
-    // 或 HTML 表格 <table>...</table>
-    // 表格整块输出，不切分
-}
+// 1. 解析 HTML 表格获取行
+List<String> rows = parseHtmlTable(html);
 
-// 检测列表结构
-private boolean isListItem(String line) {
-    // 检测 - item, 1. item, (1) item 等格式
-    // 列表项与前导句合并
+// 2. 前2行作为表头
+List<String> headerRows = rows.subList(0, 2);
+String headerText = String.join("\n", headerRows);
+
+// 3. 数据行按 300 token 限制切分，每 chunk 必须包含表头
+for (int i = 2; i < rows.size(); i++) {
+    if (currentTokens + estimateTokens(rows.get(i)) > 300 && !currentRows.isEmpty()) {
+        chunks.add(headerText + "\n" + String.join("\n", currentRows));
+        currentRows.clear();
+        currentTokens = estimateTokens(headerText);
+    }
+    currentRows.add(rows.get(i));
+    currentTokens += estimateTokens(rows.get(i));
 }
 ```
 
-**方案 C: 引入 DeepDoc 级别的切分 (高成本)**
+#### 4.2.6 列表前导句处理
 
-需要:
-- 部署 Python 微服务
-- ONNX 模型推理
-- 复杂的状态管理
-
-不推荐，除非有特殊需求（如简历解析）。
-
-#### 2.4.5 优先级评估
-
-| 优化项 | 难度 | 收益 | 推荐 |
-|--------|------|------|------|
-| **标题作为 prefix** | 低 | 中 (检索质量提升) | ✅ 推荐 |
-| **表格整块保留** | 中 | 高 (表格检索质量) | ✅ 推荐 |
-| **列表前导句合并** | 中 | 中 (列表语义完整) | ⚠️ 备选 |
-| **Token 级切分** | 中 | 中 (切分更均匀) | ⚠️ 备选 |
-| **DeepDoc 集成** | 高 | 高 (最优效果) | ❌ 暂不推荐 |
-
-#### 2.4.6 可用配置
-
-```yaml
-# 当前配置
-file:
-  parsing:
-    chunk-size: 512  # 字符数，不是 token 数
-
-# 建议优化配置
-file:
-  parsing:
-    chunk-size: 512
-    # chunk-token-num: 128  # 未来可切换为 token 数
-    preserve-tables: true    # 表格整块保留
-    merge-list-leading: true # 列表前导句合并
-    heading-as-prefix: true  # 标题作为 chunk 前缀
+```java
+// 1. 识别前导句（以冒号/句号结尾的说明句）
+// 2. 前导句 + 列表项 合并为1个整体 chunk
+// 3. 如果整体超过 max_size，过拆分但每个 chunk 保留前导句
+//    chunk1: [前导句] + (1) + (2)
+//    chunk2: [前导句] + (3) + (4)
 ```
+
+### 4.3 Bug 修复记录
+
+#### 4.3.1 Critical: 表格类型被跳过
+
+**问题现象**：表格解析日志从未出现，所有表格块被跳过
+
+**根本原因**：
+```java
+// extractTextFromV2Block 对 table 类型返回空字符串
+String text = extractTextFromV2Block(type, contentObj);  // table 返回 ""
+
+// 外层判断 text.isBlank() 时跳过，导致 table 类型永远无法进入 switch
+if (text.isBlank() && !"table".equals(type)) {
+    continue;  // table 被错误跳过
+}
+```
+
+**修复方案**：
+```java
+String text = extractTextFromV2Block(type, contentObj);
+// 注意：table 类型返回空字符串，但需要进入 switch 处理表格，不能跳过
+if (text.isBlank() && !"table".equals(type)) {
+    continue;
+}
+```
+
+#### 4.3.2 页码计算错误
+
+**问题**：页码显示 21 而不是 1-4
+
+**原因**：使用 `block.path("page_idx")` 获取的是块内部索引，而非页码
+
+**修复**：
+```java
+int pageNum = pageIdx + 1;  // 使用数组索引 +1 作为页码
+```
+
+#### 4.3.3 表格 HTML 字段错误
+
+**问题**：`contentObj.path("table_body")` 返回空
+
+**原因**：JSON 中表格 HTML 字段是 `html`，不是 `table_body`
+
+**修复**：
+```java
+String tableBody = contentObj.path("html").asText("");
+```
+
+#### 4.3.4 表格 Caption 格式错误
+
+**问题**：caption 提取失败
+
+**原因**：`table_caption` 是数组，不是字符串
+
+**修复**：
+```java
+JsonNode captionNode = block.path("table_caption");
+if (captionNode.isArray() && captionNode.size() > 0) {
+    String captionPreview = captionNode.get(0).path("content").asText();
+}
+```
+
+#### 4.3.5 列表 Lead 提取位置错误
+
+**问题**：前导句始终为空
+
+**原因**：`lead` 在 block 层级，不在 contentObj 内
+
+**修复**：
+```java
+// 修改方法签名接收完整 block
+parseListChunkV2(block, contentObj, ...)
+// 从 block.path("lead") 提取
+```
+
+#### 4.3.6 表头换行符缺失
+
+**问题**：表头两行连接在一起，语义不清
+
+**修复**：
+```java
+String header = rows[0] + "\n" + rows[1];  // 添加换行符
+```
+
+### 4.4 实施检查清单
+
+| 阶段 | 任务 | 状态 |
+|------|------|------|
+| 阶段一 | 重写 `MinerUService.parseMarkdownWithStructure()` 使用 content_list_v2.json | ✅ 完成 |
+| 阶段一 | 标题层级识别 + section path 构建 | ✅ 完成 |
+| 阶段一 | 表格检测 + 按行切分 + 前2行表头复制（max_size=300 token） | ✅ 完成 |
+| 阶段一 | 列表前导句绑定（前导句+items合并，过长拆分但保留前导句） | ✅ 完成 |
+| 阶段一 | 关键条款识别（关键词匹配，max_size=1536） | ✅ 完成 |
+| 阶段一 | 智能 overlap（100 token + 扩展到句子边界） | ✅ 完成 |
+| 阶段一 | sentence-aware split（避免句子中间截断） | ✅ 完成 |
+| 阶段二 | Tika 正则结构识别 | ⏳ 待实施 |
+| 阶段三 | TextChunk/EsDocument 新增字段 | ⏳ 待实施 |
+| 阶段三 | prev/next chunk 串联 | ⏳ 待实施 |
 
 ---
 
-### 2.5 MinerU 文档解析增强 ✅
+## 五、待优化项
 
-#### 2.3.1 问题背景
-
-| 解析方式 | 输出格式 | 表格处理 | 图片OCR | 代码解析 |
-|---------|---------|---------|--------|---------|
-| Apache Tika | 纯文本 | ❌ 差 | ❌ 无 | ❌ 无 |
-| MinerU (vlm) | Markdown + JSON | ✅ 保留结构 | ✅ OCR | ✅ 保留 |
-
-#### 2.3.2 技术方案对比
-
-| 方案 | 成本 | 精度 | 部署难度 | 状态 |
-|------|------|------|---------|------|
-| **Apache Tika** | 免费 | 基础 | 简单 | ❌ 原有 |
-| **DeepDoc (Python)** | 免费 | 高 | 复杂 (需 ONNX) | ❌ 未采用 |
-| **MinerU API** | 按量计费 | 高 | 简单 (HTTP API) | ✅ 现有 |
-| **阿里云文档解析** | 按量计费 | 高 | 简单 | ⚠️ 备选 |
-
-#### 2.3.3 现有架构流程
-
-```
-用户上传 PDF
-    │
-    ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│ 1. MinIO 存储 (原有流程不变)                                                │
-│    → 分片上传 → 合并 → merged/{md5}                                         │
-│    → 发送 Kafka 消息                                                        │
-└─────────────────────────────────────────────────────────────────────────────┘
-    │
-    ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│ 2. FileProcessingConsumer 处理                                              │
-│    → 下载 MinIO 文件到本地临时目录                                           │
-│    → 调用 MinerUService.uploadAndParse()                                   │
-└─────────────────────────────────────────────────────────────────────────────┘
-    │
-    ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│ 3. MinerU API 调用流程                                                     │
-│    ┌─────────────────────────────────────────────────────────────────┐     │
-│    │ applyUploadUrl() → 申请上传链接 + batch_id                        │     │
-│    │         ↓                                                         │     │
-│    │ uploadFile() → PUT 上传 PDF 到 MinerU OSS (预签名 URL)             │     │
-│    │         ↓                                                         │     │
-│    │ waitForBatchDone() → 轮询 (最多100次, 每次5秒)                    │     │
-│    │         ↓                                                         │     │
-│    │ downloadAndParseZip() → 下载 ZIP → 解压 full.md/content.json      │     │
-│    └─────────────────────────────────────────────────────────────────┘     │
-└─────────────────────────────────────────────────────────────────────────────┘
-    │
-    ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│ 4. 结果处理                                                                 │
-│    → MinerUParseResult 存入 MySQL (mineru_parse_result 表)                 │
-│    → 文本块向量化 → 存入 Elasticsearch                                       │
-│    → 清理本地临时文件                                                       │
-└─────────────────────────────────────────────────────────────────────────────┘
-    │
-    ▼
-降级: MinerU 失败 → 自动降级到 Tika
-```
-
-#### 2.3.4 MinerU 返回文件说明
-
-| 文件 | 内容 | 大小示例 | 用途 |
-|------|------|---------|------|
-| `full.md` | 完整 Markdown | ~3KB | RAG 检索文本来源 |
-| `content_list_v2.json` | 结构化内容列表 | ~26KB | 精细分块、页码追溯 |
-| `layout.json` | 布局信息 | ~82KB | 调试用，不存储 |
-| `*_origin.pdf` | 原始 PDF | ~224KB | ❌ 不存储 (MinIO 已有) |
-
-#### 2.3.5 配置项
-
-```yaml
-MinerU:
-  enabled: true                                         # 启用 MinerU
-  api-url: https://mineru.net
-  api-key: eyJ0eXBl...                                # Token
-  model-version: vlm
-  language: ch
-  enable-table: true                                   # 表格识别
-  enable-formula: true                                 # 公式识别
-  is-ocr: true                                         # 图片 OCR
-  polling-max-attempts: 100
-  polling-interval-ms: 5000
-  timeout-ms: 30000
-  temp-download-path: D:/tmp/mineru                    # Windows 临时目录
-```
-
-#### 2.3.6 端到端验证日志
-
-```
-[MinerU] 开始解析文件: RAG简历.pdf, 大小: 224750 bytes
-[MinerU] 申请上传链接响应状态: 200
-[MinerU] batch_id: 5f732568-9afc-4ae2-aa1f-d2a824104fd4
-[MinerU] 文件上传成功 (HTTP 200)
-[MinerU] 轮询状态: waiting-file → done
-[MinerU] ZIP 下载完成: 239476 bytes
-[MinerU] 提取到 full.md: 2612 bytes
-[MinerU] 提取到 content_list_v2.json: 26319 bytes
-[MinerU] 解析完成，共 12 个文本块
-```
-
-#### 2.3.7 注意事项
-
-1. **YAML 配置结构**：必须使用扁平结构 `api-url`/`api-key`
-2. **Windows 路径**：`temp-download-path` 使用 `D:/tmp/mineru`
-3. **降级机制**：MinerU 失败时自动降级到 Tika
-4. **文件清理**：解析完成后删除本地临时文件
-
----
-
-## 四、待优化项
-
-### 4.1 对话记忆摘要 (中优先级)
+### 5.1 对话记忆摘要 (中优先级)
 
 **现状**：
 - Redis 存储，TTL 7天，限制 20 条（简单截断）
@@ -577,7 +578,7 @@ public class ConversationMemoryService {
 
 ---
 
-### 4.2 MCP 协议 + Agent 架构 (中优先级)
+### 5.2 MCP 协议 + Agent 架构 (中优先级)
 
 **现状**：
 - 仅有单轮问答能力
@@ -602,7 +603,7 @@ public class ReActAgent {
 
 ---
 
-### 4.3 RAG 评测框架 (低优先级)
+### 5.3 RAG 评测框架 (低优先级)
 
 **现状**：仅有用量统计，无效果评测
 
@@ -613,7 +614,7 @@ public class ReActAgent {
 public class EvalDataset {
     String query;           // 用户问题
     String groundTruth;     // 标准答案
-    List<String> relDocIds; // 相关文档 ID
+    List<String> relDocIds;  // 相关文档 ID
 }
 
 // 2. 评测指标
@@ -625,9 +626,9 @@ public class EvalDataset {
 
 ---
 
-## 五、文件变更清单
+## 六、文件变更清单
 
-### 5.1 已修改文件
+### 6.1 已修改文件
 
 | 文件 | 变更类型 | 说明 |
 |------|---------|------|
@@ -635,18 +636,18 @@ public class EvalDataset {
 | `service/QueryRewriteService.java` | 新增 | 查询改写服务 |
 | `service/ElasticsearchService.java` | 修改 | deleteByFileMd5 返回删除数量 |
 | `consumer/FileProcessingConsumer.java` | 修改 | MinerU 解析分支 + 降级逻辑 |
+| `service/MinerUService.java` | 重写 | V3 语义感知切分 |
 | `model/FileUpload.java` | 修改 | 添加解析状态字段 |
 | `application.yml` | 修改 | MinerU/Rerank/QueryRewrite 配置 |
 | `frontend/src/enum/index.ts` | 修改 | ParseStatus 枚举 |
 
-### 5.2 新增文件
+### 6.2 新增文件
 
 | 文件 | 说明 |
 |------|------|
 | `config/RerankProperties.java` | Rerank 配置类 |
 | `client/RerankClient.java` | DashScope qwen-rerank API 客户端 |
 | `config/MinerUProperties.java` | MinerU 配置类 |
-| `service/MinerUService.java` | MinerU API 服务 |
 | `model/MinerUParseResult.java` | MinerU 解析结果实体 |
 | `repository/MinerUParseResultRepository.java` | MinerU 数据访问 |
 | `test/MinerUApiDemo.java` | MinerU API 验证 Demo |
@@ -654,7 +655,7 @@ public class EvalDataset {
 
 ---
 
-## 六、技术债务与风险
+## 七、技术债务与风险
 
 | 项目 | 风险 | 缓解措施 |
 |------|------|---------|
@@ -666,20 +667,20 @@ public class EvalDataset {
 
 ---
 
-## 七、配置参考
+## 八、配置参考
 
-### 7.1 环境变量
+### 8.1 环境变量
 
 ```bash
 # 必须配置
 export MINERU_TOKEN="your-mineru-token"
-export EMBEDDING_API_KEY="your-aliyun-key"  # 通义千问 API Key
+export EMBEDDING_API_KEY="your-aliyun-key"
 
 # 可选配置
 export ELASTIC_PASSWORD="PaiSmart2025"
 ```
 
-### 7.2 关键端口
+### 8.2 关键端口
 
 | 服务 | 端口 | 说明 |
 |------|------|------|

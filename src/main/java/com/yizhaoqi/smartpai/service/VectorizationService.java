@@ -82,7 +82,11 @@ public class VectorizationService {
                             embeddingResult.modelVersion(),
                             userId,
                             orgTag,
-                            isPublic
+                            isPublic,
+                            chunks.get(i).getSectionPath(),
+                            chunks.get(i).getChunkType(),
+                            chunks.get(i).isKeyClause(),
+                            chunks.get(i).getTokenCount()
                     ))
                     .toList();
 

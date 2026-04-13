@@ -3,7 +3,9 @@ package com.yizhaoqi.smartpai.service;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.yizhaoqi.smartpai.config.MinerUProperties;
-import lombok.Data;
+import com.yizhaoqi.smartpai.model.StructuredFinancialRow;
+import com.yizhaoqi.smartpai.model.TableClassificationResult;
+import com.yizhaoqi.smartpai.model.TableObject;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 
@@ -18,8 +20,12 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipInputStream;
 
@@ -34,10 +40,14 @@ public class MinerUService {
     private final MinerUProperties properties;
     private final ObjectMapper objectMapper;
     private final HttpClient httpClient;
+    private final com.yizhaoqi.smartpai.client.DeepSeekClient deepSeekClient;
 
-    public MinerUService(MinerUProperties properties, ObjectMapper objectMapper) {
+    public MinerUService(MinerUProperties properties,
+                         ObjectMapper objectMapper,
+                         com.yizhaoqi.smartpai.client.DeepSeekClient deepSeekClient) {
         this.properties = properties;
         this.objectMapper = objectMapper;
+        this.deepSeekClient = deepSeekClient;
         this.httpClient = HttpClient.newBuilder()
                 .connectTimeout(Duration.ofMillis(properties.getTimeoutMs()))
                 .build();
@@ -254,8 +264,8 @@ public class MinerUService {
                 }
             }
 
-            // 解析 full.md 为文本块
-            List<TextChunk> chunks = parseMarkdownToChunks(fullMd);
+            // V3 语义感知切分 - 利用 content_list_v2.json 实现结构化切分
+            List<TextChunk> chunks = parseMarkdownWithStructure(contentJson, fullMd);
 
             MinerUParseResult result = new MinerUParseResult();
             result.setFullMd(fullMd);
@@ -265,23 +275,24 @@ public class MinerUService {
             result.setChunks(chunks);
             result.setParseStatus("SUCCESS");
 
-            log.info("[MinerU] 解析完成，共 {} 个文本块", chunks.size());
+            log.info("[MinerU] V3 解析完成，共 {} 个文本块", chunks.size());
             return result;
 
         } finally {
-            // 清理临时文件
-            try {
-                Files.walk(tempDir)
-                        .sorted((a, b) -> -a.compareTo(b))
-                        .forEach(p -> {
-                            try {
-                                Files.delete(p);
-                            } catch (IOException ignored) {
-                            }
-                        });
-            } catch (IOException e) {
-                log.warn("[MinerU] 清理临时目录失败: {}", tempDir);
-            }
+            // 临时文件保留在 D:\tmp\mineru\ 目录下，不删除，方便调试
+            log.info("[MinerU] 临时文件保留在: {}", tempDir);
+            // try {
+            //     Files.walk(tempDir)
+            //             .sorted((a, b) -> -a.compareTo(b))
+            //             .forEach(p -> {
+            //         try {
+            //             Files.delete(p);
+            //         } catch (IOException ignored) {
+            //         }
+            //     });
+            // } catch (IOException e) {
+            //     log.warn("[MinerU] 清理临时目录失败: {}", tempDir);
+            // }
         }
     }
 
@@ -304,7 +315,9 @@ public class MinerUService {
 
     /**
      * 将 Markdown 文本切分为文本块
+     * @deprecated 使用 parseMarkdownWithStructure() 利用 content_list_v2.json 实现 V3 切分
      */
+    @Deprecated
     public List<TextChunk> parseMarkdownToChunks(String markdown) {
         List<TextChunk> chunks = new ArrayList<>();
 
@@ -380,10 +393,1260 @@ public class MinerUService {
         return chunks;
     }
 
+    // ==================== V3 语义感知切分 ====================
+
+    /** 关键条款关键词 */
+    private static final List<String> KEY_CLAUSE_KEYWORDS = Arrays.asList(
+            "保险责任", "责任免除", "费率", "赔付", "赔偿", "免责", "承保范围"
+    );
+
+    /** 普通 section 最大 token 数 */
+    private static final int MAX_TOKEN_NORMAL = 1024;
+
+    /** 关键条款最大 token 数 */
+    private static final int MAX_TOKEN_KEY_CLAUSE = 1536;
+
+    /** 表格最大 token 数 */
+    private static final int MAX_TOKEN_TABLE = 300;
+
+    /**
+     * V3 语义感知切分 - 利用 content_list_v2.json 实现结构化切分
+     */
+    public List<TextChunk> parseMarkdownWithStructure(String contentJson, String fullMd) {
+        List<TextChunk> chunks = new ArrayList<>();
+
+        if ((contentJson == null || contentJson.isBlank()) && (fullMd == null || fullMd.isBlank())) {
+            log.warn("[MinerU] contentJson 和 fullMd 都为空，尝试使用备用解析");
+            return chunks;
+        }
+
+        try {
+            // 尝试解析 content_list_v2.json
+            if (contentJson != null && !contentJson.isBlank()) {
+                JsonNode root = objectMapper.readTree(contentJson);
+                log.debug("[MinerU] JSON 根节点类型: {}, 是数组: {}", root.getNodeType(), root.isArray());
+
+                // V2: 顶层是页面数组 [[page0_blocks], [page1_blocks], ...]
+                if (root.isArray() && root.size() > 0) {
+                    // 检查第一个元素是否也是数组（如果是，说明是 V2 页面结构）
+                    JsonNode firstElement = root.get(0);
+                    if (firstElement.isArray()) {
+                        log.debug("[MinerU] 检测到 V2 页面结构，共 {} 页", root.size());
+                        // 使用两阶段解析流程
+                        return parseContentListV2TwoStage(root);
+                    } else {
+                        // 扁平数组，可能是 V1 content_list，降级处理
+                        log.debug("[MinerU] V1 content_list 扁平数组，降级到 parseMarkdownFallback");
+                        return parseMarkdownFallback(fullMd);
+                    }
+                }
+
+                // 非数组，尝试获取 content_list_v2 字段
+                JsonNode contentList = root.get("content_list_v2");
+                if (contentList != null && contentList.isArray()) {
+                    log.debug("[MinerU] content_list_v2 数组大小: {}", contentList.size());
+                    return parseContentListV2(contentList);
+                }
+
+                log.warn("[MinerU] 无法识别 JSON 结构，根节点: {}", root.getNodeType());
+            }
+        } catch (Exception e) {
+            log.warn("[MinerU] 解析 content_list_v2.json 失败: {}, 降级到 Markdown 解析", e.getMessage());
+        }
+
+        // 降级：使用 fullMd 解析
+        return parseMarkdownFallback(fullMd);
+    }
+
+    /**
+     * 两阶段表格解析入口
+     *
+     * 阶段 1: 提取所有 TableObject
+     * 阶段 2: LLM 分类
+     * 阶段 3: 全局一致性约束
+     * 阶段 4: 结构化行抽取（仅财务主表）
+     * 阶段 5: 生成 TextChunk（对非财务表走原流程，财务表走结构化）
+     */
+    private List<TextChunk> parseContentListV2TwoStage(JsonNode contentList) {
+        List<TextChunk> chunks = new ArrayList<>();
+
+        log.info("[MinerU] 两阶段解析: 开始");
+
+        // 阶段 1: 第一次扫描 - 提取 TableObject
+        List<TableObject> tableObjects = extractTableObjects(contentList);
+        if (tableObjects.isEmpty()) {
+            log.info("[MinerU] 两阶段解析: 未发现表格，降级到原流程");
+            return parseContentListV2(contentList);
+        }
+
+        // 阶段 2: LLM 分类
+        List<TableClassificationResult> classifications = classifyTablesWithLLM(tableObjects);
+
+        // 阶段 3: 全局一致性约束
+        classifications = applyGlobalConsistency(classifications);
+
+        // 构建 tableId -> classification 映射
+        Map<String, TableClassificationResult> classificationMap = new java.util.HashMap<>();
+        for (TableClassificationResult r : classifications) {
+            classificationMap.put(r.getTableId(), r);
+        }
+
+        // 阶段 4 & 5: 第二次扫描 + 生成 chunks
+        int chunkId = 0;
+        StringBuilder currentSectionContent = new StringBuilder();
+        String currentSectionPath = "";
+        int currentPage = 1;
+        boolean isKeyClause = false;
+
+        // 遍历每一页
+        for (int pageIdx = 0; pageIdx < contentList.size(); pageIdx++) {
+            JsonNode pageBlocks = contentList.get(pageIdx);
+            if (!pageBlocks.isArray()) continue;
+
+            int pageNum = pageIdx + 1;
+
+            // 遍历当前页的每个块
+            for (int blockIdx = 0; blockIdx < pageBlocks.size(); blockIdx++) {
+                JsonNode block = pageBlocks.get(blockIdx);
+                String type = block.path("type").asText("");
+                JsonNode contentObj = block.path("content");
+
+                // 提取文本内容
+                String text = extractTextFromV2Block(type, contentObj);
+                if (text.isBlank() && !"table".equals(type)) {
+                    continue;
+                }
+
+                switch (type) {
+                    case "title", "paragraph" -> {
+                        // 保存上一个 section
+                        if (currentSectionContent.length() > 0) {
+                            List<TextChunk> sectionChunks = splitSectionText(
+                                    currentSectionContent.toString(),
+                                    currentSectionPath,
+                                    isKeyClause ? MAX_TOKEN_KEY_CLAUSE : MAX_TOKEN_NORMAL,
+                                    chunkId,
+                                    currentPage
+                            );
+                            chunks.addAll(sectionChunks);
+                            chunkId = sectionChunks.isEmpty() ? chunkId : sectionChunks.get(sectionChunks.size() - 1).getChunkId() + 1;
+                            if (!sectionChunks.isEmpty()) {
+                                currentPage = sectionChunks.get(sectionChunks.size() - 1).getPageNumber() + 1;
+                            }
+                            currentSectionContent = new StringBuilder();
+                        }
+
+                        // 处理新标题
+                        if ("title".equals(type)) {
+                            int level = contentObj.path("level").asInt(1);
+                            currentSectionPath = buildSectionPath(currentSectionPath, text, level);
+                            isKeyClause = isKeyClauseTitle(text);
+                        }
+
+                        // paragraph 添加到当前 section
+                        if ("paragraph".equals(type)) {
+                            if (currentSectionContent.length() > 0) {
+                                currentSectionContent.append("\n\n");
+                            }
+                            currentSectionContent.append(text);
+                        }
+                    }
+                    case "table" -> {
+                        // 保存当前 section
+                        if (currentSectionContent.length() > 0) {
+                            List<TextChunk> sectionChunks = splitSectionText(
+                                    currentSectionContent.toString(),
+                                    currentSectionPath,
+                                    isKeyClause ? MAX_TOKEN_KEY_CLAUSE : MAX_TOKEN_NORMAL,
+                                    chunkId,
+                                    currentPage
+                            );
+                            chunks.addAll(sectionChunks);
+                            chunkId = sectionChunks.isEmpty() ? chunkId : sectionChunks.get(sectionChunks.size() - 1).getChunkId() + 1;
+                            if (!sectionChunks.isEmpty()) {
+                                currentPage = sectionChunks.get(sectionChunks.size() - 1).getPageNumber() + 1;
+                            }
+                            currentSectionContent = new StringBuilder();
+                        }
+
+                        // 获取表格 ID（blockIdx 来自外层循环）
+                        String tableId = String.format("p%d_t%d", pageNum, blockIdx);
+
+                        // 查找分类结果
+                        TableClassificationResult classification = classificationMap.get(tableId);
+
+                        if (shouldExtractAsStructured(classification)) {
+                            // 高置信度结构化表：使用结构化抽取
+                            TableObject tableObj = tableObjects.stream()
+                                    .filter(t -> t.getTableId().equals(tableId))
+                                    .findFirst()
+                                    .orElse(null);
+
+                            if (tableObj != null) {
+                                List<StructuredFinancialRow> structuredRows = extractStructuredRows(tableObj, classification);
+                                // 将结构化行转换为 TextChunk
+                                List<TextChunk> tableChunks = convertStructuredRowsToChunks(
+                                        structuredRows, classification.getResolvedTitle(), chunkId, pageNum);
+                                chunks.addAll(tableChunks);
+                                if (!tableChunks.isEmpty()) {
+                                    chunkId = tableChunks.get(tableChunks.size() - 1).getChunkId() + 1;
+                                }
+                                log.info("[MinerU] 两阶段: 表 {} 使用结构化抽取，生成 {} 个 chunks",
+                                        tableId, tableChunks.size());
+                            }
+                        } else {
+                            // 非结构化表（低置信度或未知类型）：使用原流程
+                            List<TextChunk> tableChunks = parseTableChunkV2(contentObj, currentSectionPath, chunkId, pageNum);
+                            chunks.addAll(tableChunks);
+                            if (!tableChunks.isEmpty()) {
+                                chunkId = tableChunks.get(tableChunks.size() - 1).getChunkId() + 1;
+                            }
+                        }
+                    }
+                    case "list" -> {
+                        // 保存当前 section
+                        if (currentSectionContent.length() > 0) {
+                            List<TextChunk> sectionChunks = splitSectionText(
+                                    currentSectionContent.toString(),
+                                    currentSectionPath,
+                                    isKeyClause ? MAX_TOKEN_KEY_CLAUSE : MAX_TOKEN_NORMAL,
+                                    chunkId,
+                                    currentPage
+                            );
+                            chunks.addAll(sectionChunks);
+                            chunkId = sectionChunks.isEmpty() ? chunkId : sectionChunks.get(sectionChunks.size() - 1).getChunkId() + 1;
+                            if (!sectionChunks.isEmpty()) {
+                                currentPage = sectionChunks.get(sectionChunks.size() - 1).getPageNumber() + 1;
+                            }
+                            currentSectionContent = new StringBuilder();
+                        }
+
+                        // 处理列表
+                        List<TextChunk> listChunks = parseListChunkV2(block, contentObj, currentSectionPath, chunkId, pageNum);
+                        chunks.addAll(listChunks);
+                        if (!listChunks.isEmpty()) {
+                            chunkId = listChunks.get(listChunks.size() - 1).getChunkId() + 1;
+                        }
+                    }
+                    default -> {
+                        if (currentSectionContent.length() > 0) {
+                            currentSectionContent.append("\n\n");
+                        }
+                        currentSectionContent.append(text);
+                    }
+                }
+            }
+        }
+
+        // 处理最后一个 section
+        if (currentSectionContent.length() > 0) {
+            List<TextChunk> sectionChunks = splitSectionText(
+                    currentSectionContent.toString(),
+                    currentSectionPath,
+                    isKeyClause ? MAX_TOKEN_KEY_CLAUSE : MAX_TOKEN_NORMAL,
+                    chunkId,
+                    currentPage
+            );
+            chunks.addAll(sectionChunks);
+        }
+
+        // 串联 prev/next
+        linkNeighboringChunks(chunks);
+
+        log.info("[MinerU] 两阶段解析: 完成，共 {} 个 chunks", chunks.size());
+        return chunks;
+    }
+
+    /**
+     * 将结构化财务行转换为 TextChunk
+     */
+    private List<TextChunk> convertStructuredRowsToChunks(
+            List<StructuredFinancialRow> rows,
+            String resolvedTitle,
+            int startChunkId,
+            int startPage) {
+
+        List<TextChunk> chunks = new ArrayList<>();
+        if (rows.isEmpty()) return chunks;
+
+        // 按 tableId 分组，每组一个 chunk
+        Map<String, List<StructuredFinancialRow>> byTable = new java.util.HashMap<>();
+        for (StructuredFinancialRow row : rows) {
+            byTable.computeIfAbsent(row.getTableId(), k -> new ArrayList<>()).add(row);
+        }
+
+        int chunkId = startChunkId;
+        int page = startPage;
+
+        for (Map.Entry<String, List<StructuredFinancialRow>> entry : byTable.entrySet()) {
+            List<StructuredFinancialRow> tableRows = entry.getValue();
+            StringBuilder sb = new StringBuilder();
+            sb.append("【").append(resolvedTitle).append("】\n");
+
+            // 按年份分组显示
+            Map<String, List<StructuredFinancialRow>> byYear = new java.util.HashMap<>();
+            for (StructuredFinancialRow row : tableRows) {
+                byYear.computeIfAbsent(row.getYear(), k -> new ArrayList<>()).add(row);
+            }
+
+            for (Map.Entry<String, List<StructuredFinancialRow>> yearEntry : byYear.entrySet()) {
+                sb.append("\n").append(yearEntry.getKey()).append("年:\n");
+                for (StructuredFinancialRow row : yearEntry.getValue()) {
+                    sb.append("- ").append(row.getItem()).append(": ").append(row.getValue());
+                    if (!"百万元".equals(row.getUnit())) {
+                        sb.append(" ").append(row.getUnit());
+                    }
+                    sb.append("\n");
+                }
+            }
+
+            String content = sb.toString().trim();
+            int tokens = estimateTokens(content);
+            TextChunk chunk = new TextChunk(chunkId++, content, page, resolvedTitle, "table", false, tokens);
+            chunks.add(chunk);
+            page++;
+        }
+
+        return chunks;
+    }
+
+    /**
+     * 解析 content_list_v2.json 结构
+     * V2 结构：顶层是页面数组 [[page0_blocks], [page1_blocks], ...]
+     * 每个 block 有 type + content (content 是对象，不是字符串)
+     */
+    private List<TextChunk> parseContentListV2(JsonNode contentList) {
+        List<TextChunk> chunks = new ArrayList<>();
+        int chunkId = 0;
+        StringBuilder currentSectionContent = new StringBuilder();
+        String currentSectionPath = "";
+        int currentPage = 1;
+        boolean isKeyClause = false;
+
+        // V2 顶层是页面数组
+        if (!contentList.isArray()) {
+            log.warn("[MinerU] V2 contentList 不是数组，跳过");
+            return chunks;
+        }
+
+        log.debug("[MinerU] V2 解析：共 {} 页", contentList.size());
+
+        // 遍历每一页
+        for (int pageIdx = 0; pageIdx < contentList.size(); pageIdx++) {
+            JsonNode pageBlocks = contentList.get(pageIdx);
+            if (!pageBlocks.isArray()) continue;
+
+            log.debug("[MinerU] V2 解析第 {} 页，共 {} 个块", pageIdx, pageBlocks.size());
+
+            // 遍历当前页的每个块
+            for (JsonNode block : pageBlocks) {
+                String type = block.path("type").asText("");
+                JsonNode contentObj = block.path("content");
+
+                // 提取文本内容
+                String text = extractTextFromV2Block(type, contentObj);
+                // 注意：table 类型返回空字符串，但需要进入 switch 处理表格，不能跳过
+                if (text.isBlank() && !"table".equals(type)) {
+                    continue;
+                }
+
+                // 计算页码 (pageIdx 从 0 开始，转为 1 开始)
+                // 注意：block 内的 page_idx 是块在页面内的索引，不是 PDF 页码
+                // PDF 真实页码应该用 pageIdx（数组索引）+ 1
+                int pageNum = pageIdx + 1;
+
+                // 根据 type 处理
+                switch (type) {
+                    case "title", "paragraph" -> {
+                        // 保存上一个 section
+                        if (currentSectionContent.length() > 0) {
+                            List<TextChunk> sectionChunks = splitSectionText(
+                                    currentSectionContent.toString(),
+                                    currentSectionPath,
+                                    isKeyClause ? MAX_TOKEN_KEY_CLAUSE : MAX_TOKEN_NORMAL,
+                                    chunkId,
+                                    currentPage
+                            );
+                            chunks.addAll(sectionChunks);
+                            chunkId = sectionChunks.isEmpty() ? chunkId : sectionChunks.get(sectionChunks.size() - 1).getChunkId() + 1;
+                            if (!sectionChunks.isEmpty()) {
+                                currentPage = sectionChunks.get(sectionChunks.size() - 1).getPageNumber() + 1;
+                            }
+                            currentSectionContent = new StringBuilder();
+                        }
+
+                        // 处理新标题
+                        if ("title".equals(type)) {
+                            int level = contentObj.path("level").asInt(1);
+                            currentSectionPath = buildSectionPath(currentSectionPath, text, level);
+                            isKeyClause = isKeyClauseTitle(text);
+                        }
+
+                        // paragraph 添加到当前 section
+                        if ("paragraph".equals(type)) {
+                            if (currentSectionContent.length() > 0) {
+                                currentSectionContent.append("\n\n");
+                            }
+                            currentSectionContent.append(text);
+                        }
+                    }
+                    case "table" -> {
+                        // 保存当前 section
+                        if (currentSectionContent.length() > 0) {
+                            List<TextChunk> sectionChunks = splitSectionText(
+                                    currentSectionContent.toString(),
+                                    currentSectionPath,
+                                    isKeyClause ? MAX_TOKEN_KEY_CLAUSE : MAX_TOKEN_NORMAL,
+                                    chunkId,
+                                    currentPage
+                            );
+                            chunks.addAll(sectionChunks);
+                            chunkId = sectionChunks.isEmpty() ? chunkId : sectionChunks.get(sectionChunks.size() - 1).getChunkId() + 1;
+                            if (!sectionChunks.isEmpty()) {
+                                currentPage = sectionChunks.get(sectionChunks.size() - 1).getPageNumber() + 1;
+                            }
+                            currentSectionContent = new StringBuilder();
+                        }
+
+                        // 处理表格
+                        List<TextChunk> tableChunks = parseTableChunkV2(contentObj, currentSectionPath, chunkId, pageNum);
+                        chunks.addAll(tableChunks);
+                        if (!tableChunks.isEmpty()) {
+                            chunkId = tableChunks.get(tableChunks.size() - 1).getChunkId() + 1;
+                        }
+                    }
+                    case "list" -> {
+                        // 保存当前 section
+                        if (currentSectionContent.length() > 0) {
+                            List<TextChunk> sectionChunks = splitSectionText(
+                                    currentSectionContent.toString(),
+                                    currentSectionPath,
+                                    isKeyClause ? MAX_TOKEN_KEY_CLAUSE : MAX_TOKEN_NORMAL,
+                                    chunkId,
+                                    currentPage
+                            );
+                            chunks.addAll(sectionChunks);
+                            chunkId = sectionChunks.isEmpty() ? chunkId : sectionChunks.get(sectionChunks.size() - 1).getChunkId() + 1;
+                            if (!sectionChunks.isEmpty()) {
+                                currentPage = sectionChunks.get(sectionChunks.size() - 1).getPageNumber() + 1;
+                            }
+                            currentSectionContent = new StringBuilder();
+                        }
+
+                        // 处理列表
+                        List<TextChunk> listChunks = parseListChunkV2(block, contentObj, currentSectionPath, chunkId, pageNum);
+                        chunks.addAll(listChunks);
+                        if (!listChunks.isEmpty()) {
+                            chunkId = listChunks.get(listChunks.size() - 1).getChunkId() + 1;
+                        }
+                    }
+                    default -> {
+                        // 其他类型（如 equation_interline, code 等），添加到当前 section
+                        if (currentSectionContent.length() > 0) {
+                            currentSectionContent.append("\n\n");
+                        }
+                        currentSectionContent.append(text);
+                    }
+                }
+            }
+        }
+
+        // 处理最后一个 section
+        if (currentSectionContent.length() > 0) {
+            List<TextChunk> sectionChunks = splitSectionText(
+                    currentSectionContent.toString(),
+                    currentSectionPath,
+                    isKeyClause ? MAX_TOKEN_KEY_CLAUSE : MAX_TOKEN_NORMAL,
+                    chunkId,
+                    currentPage
+            );
+            chunks.addAll(sectionChunks);
+        }
+
+        // 串联 prev/next
+        linkNeighboringChunks(chunks);
+
+        log.info("[MinerU] V3 切分完成，共 {} 个 chunks", chunks.size());
+        return chunks;
+    }
+
+    /**
+     * 从 V2 块中提取文本内容
+     * V2 content 是对象，格式如：{"title_content": [...], "level": 1}
+     */
+    private String extractTextFromV2Block(String type, JsonNode contentObj) {
+        if (contentObj.isMissingNode() || contentObj.isNull()) {
+            return "";
+        }
+
+        switch (type) {
+            case "title" -> {
+                // {"title_content": [{"type": "text", "content": "..."}], "level": 1}
+                JsonNode titleContent = contentObj.path("title_content");
+                if (titleContent.isArray() && titleContent.size() > 0) {
+                    return titleContent.get(0).path("content").asText("");
+                }
+            }
+            case "paragraph" -> {
+                // {"paragraph_content": [{"type": "text", "content": "..."}]}
+                JsonNode paraContent = contentObj.path("paragraph_content");
+                if (paraContent.isArray() && paraContent.size() > 0) {
+                    return paraContent.get(0).path("content").asText("");
+                }
+            }
+            case "equation_interline" -> {
+                // {"equation_interline_content": [{"type": "text", "content": "..."}]}
+                JsonNode eqContent = contentObj.path("equation_interline_content");
+                if (eqContent.isArray() && eqContent.size() > 0) {
+                    return "[公式] " + eqContent.get(0).path("content").asText("");
+                }
+            }
+            case "list" -> {
+                // {"list_items": [{"type": "text", "content": "..."}]}
+                StringBuilder sb = new StringBuilder();
+                JsonNode listItems = contentObj.path("list_items");
+                if (listItems.isArray()) {
+                    for (JsonNode item : listItems) {
+                        String itemText = item.path("content").asText("");
+                        if (!itemText.isBlank()) {
+                            sb.append(itemText).append("\n");
+                        }
+                    }
+                }
+                return sb.toString().trim();
+            }
+            case "table" -> {
+                // table 不在这里处理，返回空，调用方会调用 parseTableChunkV2
+                return "";
+            }
+            case "image", "chart" -> {
+                // 图片/图表说明
+                JsonNode caption = contentObj.path("image_caption");
+                if (caption.isMissingNode()) caption = contentObj.path("chart_caption");
+                if (caption.isArray() && caption.size() > 0) {
+                    return "[图片] " + caption.get(0).asText("");
+                }
+            }
+            case "code", "algorithm" -> {
+                JsonNode codeBody = contentObj.path("code_body");
+                if (codeBody.isMissingNode()) codeBody = contentObj.path("algorithm_body");
+                if (!codeBody.isMissingNode() && !codeBody.isNull()) {
+                    return "[代码] " + codeBody.asText("");
+                }
+            }
+        }
+        return "";
+    }
+
+    /**
+     * V2 表格解析
+     * V3: 小表格(≤300 token)整体为1个chunk，大表格按行切分每行带表头
+     *
+     * 修复记录:
+     * 1. HTML 表格转为结构化文本，避免 embedding 噪声
+     * 2. caption 取所有元素拼接，而非只取第一个
+     * 3. 跳过 <table> 垃圾元素，正确识别表头行
+     * 4. 缺失 caption 时使用 sectionPath 作为语义锚点
+     */
+    private List<TextChunk> parseTableChunkV2(JsonNode contentObj, String sectionPath, int startChunkId, int startPage) {
+        List<TextChunk> chunks = new ArrayList<>();
+        try {
+            // 表格内容在 html 字段 (HTML 格式)
+            // V2 JSON 结构: {"type": "table", "content": {"html": "<table>...</table>", "table_caption": [...], ...}}
+            String tableBody = contentObj.path("html").asText("");
+            if (tableBody.isBlank()) {
+                log.debug("[MinerU] V2 表格 html 为空，跳过");
+                return chunks;
+            }
+
+            // table_caption 是数组，格式: [{"type": "text", "content": "..."}]
+            // 修复: 取所有 caption 元素拼接，而非只取第一个
+            JsonNode captionNode = contentObj.path("table_caption");
+            StringBuilder captionBuilder = new StringBuilder();
+            if (captionNode.isArray()) {
+                for (JsonNode cn : captionNode) {
+                    String text = cn.path("content").asText("");
+                    if (!text.isBlank()) {
+                        if (captionBuilder.length() > 0) {
+                            captionBuilder.append(" / ");
+                        }
+                        captionBuilder.append(text);
+                    }
+                }
+            }
+            String tableCaption = captionBuilder.toString();
+            log.info("[MinerU] V2 表格解析: caption=\"{}\", html 长度={}", tableCaption, tableBody.length());
+
+            // 估算 token 数
+            int totalTokens = estimateTokens(tableBody);
+            log.debug("[MinerU] V2 表格总 token 数: {}", totalTokens);
+
+            // 将 HTML 表格转为结构化文本
+            // 格式: "行名 | 2022 | 2023E | 2024E | 2025E"
+            String structuredTable = convertHtmlTableToText(tableBody, tableCaption);
+            if (structuredTable == null || structuredTable.isBlank()) {
+                log.warn("[MinerU] V2 表格结构化失败，使用原始 HTML");
+                structuredTable = tableBody;
+            }
+
+            // 小表格整体作为一个 chunk
+            if (totalTokens <= MAX_TOKEN_TABLE) {
+                // 修复: 缺失 caption 时使用 sectionPath 作为语义锚点
+                String anchorText = !tableCaption.isBlank() ? tableCaption
+                    : (!sectionPath.isBlank() ? sectionPath : "数据表");
+                String chunkText = anchorText + "\n" + structuredTable;
+                int chunkTokens = estimateTokens(chunkText);
+                TextChunk chunk = new TextChunk(startChunkId, chunkText, startPage, sectionPath, "table", false, chunkTokens);
+                chunks.add(chunk);
+                log.debug("[MinerU] V2 小表格(结构化)整体作为1个chunk, anchor=\"{}\"", anchorText);
+                return chunks;
+            }
+
+            // 大表格按行切分
+            String[] rows = structuredTable.split("\n");
+            log.debug("[MinerU] V2 大表格结构化后共 {} 行", rows.length);
+
+            if (rows.length <= 2) {
+                String anchorText = !tableCaption.isBlank() ? tableCaption : (!sectionPath.isBlank() ? sectionPath : "数据表");
+                String chunkText = anchorText + "\n" + structuredTable;
+                int chunkTokens = estimateTokens(chunkText);
+                TextChunk chunk = new TextChunk(startChunkId, chunkText, startPage, sectionPath, "table", false, chunkTokens);
+                chunks.add(chunk);
+                return chunks;
+            }
+
+            // 取前2行作为表头
+            String header = rows[0] + "\n" + rows[1];
+            int headerTokens = estimateTokens(header);
+            log.debug("[MinerU] V2 表格表头 token 数: {}, 表头内容: {}", headerTokens, header);
+
+            List<String> dataRows = new ArrayList<>();
+            for (int i = 2; i < rows.length; i++) {
+                dataRows.add(rows[i]);
+            }
+            log.debug("[MinerU] V2 表格数据行数: {}", dataRows.size());
+
+            List<String> currentRows = new ArrayList<>();
+            int currentTokens = headerTokens;
+            int page = startPage;
+            int chunkId = startChunkId;
+
+            for (String row : dataRows) {
+                int rowTokens = estimateTokens(row);
+                if (currentTokens + rowTokens > MAX_TOKEN_TABLE && !currentRows.isEmpty()) {
+                    String chunkText = header + "\n" + String.join("\n", currentRows);
+                    int chunkTokens = estimateTokens(chunkText);
+                    TextChunk chunk = new TextChunk(chunkId++, chunkText, page, sectionPath, "table", false, chunkTokens);
+                    chunks.add(chunk);
+                    page++;
+                    currentRows.clear();
+                    currentTokens = headerTokens;
+                }
+                currentRows.add(row);
+                currentTokens += rowTokens;
+            }
+
+            if (!currentRows.isEmpty()) {
+                String chunkText = header + "\n" + String.join("\n", currentRows);
+                int chunkTokens = estimateTokens(chunkText);
+                TextChunk chunk = new TextChunk(chunkId, chunkText, page, sectionPath, "table", false, chunkTokens);
+                chunks.add(chunk);
+            }
+
+            // 记录表格 chunk 详情
+            log.info("[MinerU] V2 表格切分完成，共 {} 个 chunks", chunks.size());
+            for (int i = 0; i < chunks.size(); i++) {
+                TextChunk c = chunks.get(i);
+                String preview = c.getContent().length() > 100 ? c.getContent().substring(0, 100) + "..." : c.getContent();
+                log.info("[MinerU]   chunk[{}]: page={}, tokens={}, preview=\"{}\"",
+                        i, c.getPageNumber(), c.getTokenCount(), preview.replace("\n", "\\n"));
+            }
+
+        } catch (Exception e) {
+            log.warn("[MinerU] V2 表格解析失败: {}", e.getMessage());
+        }
+        return chunks;
+    }
+
+    /**
+     * 将 HTML 表格转换为结构化文本
+     * 格式: "行名 | 2022 | 2023E | 2024E | 2025E"
+     *
+     * 修复 HTML 噪声问题:
+     * - 原始 HTML <table><tr><td>...</td>...</tr></table> 包含大量标签噪声
+     * - embedding 模型会把 <td> 和 </td> 当成语义内容
+     * - 生成模型容易在长 HTML 中间串行
+     *
+     * 使用正则表达式解析，不引入额外依赖
+     */
+    private String convertHtmlTableToText(String html, String caption) {
+        if (html == null || html.isBlank()) {
+            return null;
+        }
+
+        try {
+            StringBuilder sb = new StringBuilder();
+            // 如果有 caption，作为表名注释
+            if (!caption.isBlank()) {
+                sb.append("【").append(caption).append("】\n");
+            }
+
+            // 提取所有 <tr>...</tr> 行
+            // 处理 <tr>xxx</tr> 或嵌套的 <tr>xxx<tr>xxx</tr>yyy</tr> 情况
+            Pattern rowPattern = Pattern.compile("<tr[^>]*>(.*?)</tr>", Pattern.DOTALL | Pattern.CASE_INSENSITIVE);
+            Matcher rowMatcher = rowPattern.matcher(html);
+
+            while (rowMatcher.find()) {
+                String rowContent = rowMatcher.group(1);
+
+                // 提取单元格内容 <td>xxx</td> 或 <th>xxx</th>
+                Pattern cellPattern = Pattern.compile("<t[hd][^>]*>(.*?)</t[hd]>", Pattern.DOTALL | Pattern.CASE_INSENSITIVE);
+                Matcher cellMatcher = cellPattern.matcher(rowContent);
+
+                List<String> cells = new ArrayList<>();
+                while (cellMatcher.find()) {
+                    // 清理单元格文本：移除 HTML 标签、多余空白
+                    String cellText = cellMatcher.group(1)
+                            .replaceAll("<[^>]+>", "")  // 移除所有 HTML 标签
+                            .replaceAll("\\s+", " ")     // 合并多余空白
+                            .trim();
+                    cells.add(cellText);
+                }
+
+                if (!cells.isEmpty()) {
+                    // 使用 | 分隔，格式: "指标名 | 值1 | 值2 | ..."
+                    sb.append(String.join(" | ", cells));
+                    sb.append("\n");
+                }
+            }
+
+            String result = sb.toString().trim();
+            if (result.isBlank()) {
+                log.warn("[MinerU] HTML 表格解析后为空，caption={}", caption);
+                return null;
+            }
+
+            log.debug("[MinerU] HTML 表格结构化成功，caption={}, 行数={}", caption,
+                    result.split("\n").length);
+            return result;
+
+        } catch (Exception e) {
+            log.warn("[MinerU] HTML 表格结构化失败: {}, 原始前200字符: {}",
+                    e.getMessage(),
+                    html.length() > 200 ? html.substring(0, 200) : html);
+            return null;
+        }
+    }
+
+    /**
+     * V2 列表解析
+     * V3: 前导句 + 列表项合并，过长则保留前导句拆分
+     * @param block 完整 block 节点，用于提取 lead 字段
+     * @param contentObj block.content 节点，包含 list_items
+     */
+    private List<TextChunk> parseListChunkV2(JsonNode block, JsonNode contentObj, String sectionPath, int startChunkId, int startPage) {
+        List<TextChunk> chunks = new ArrayList<>();
+
+        // V2 列表结构: {"list_items": [...], "lead": "前导句"}，lead 在 block 级别，不在 content 中
+        JsonNode listItems = contentObj.path("list_items");
+        if (!listItems.isArray() || listItems.isEmpty()) {
+            return chunks;
+        }
+
+        // 提取前导句 - lead 在 block 级别
+        String lead = block.path("lead").asText("");
+        if (lead.isBlank()) {
+            // 尝试从 content 字段获取
+            lead = contentObj.path("content").asText("");
+            // 如果 content 看起来不像前导句，清空它
+            if (lead.length() > 100 || !lead.contains("：") && !lead.contains(":")) {
+                lead = "";
+            }
+        }
+
+        // 构建完整列表文本 (前导句 + 列表项)
+        StringBuilder fullList = new StringBuilder();
+        if (!lead.isBlank()) {
+            fullList.append(lead).append("\n");
+        }
+        for (JsonNode item : listItems) {
+            String itemText = item.path("content").asText("");
+            if (!itemText.isBlank()) {
+                fullList.append(itemText).append("\n");
+            }
+        }
+
+        String listText = fullList.toString().trim();
+        if (listText.isBlank()) {
+            return chunks;
+        }
+
+        int totalTokens = estimateTokens(listText);
+        int leadTokens = lead.isBlank() ? 0 : estimateTokens(lead);
+
+        // 小列表整体作为一个 chunk
+        if (totalTokens <= MAX_TOKEN_NORMAL) {
+            TextChunk chunk = new TextChunk(startChunkId, listText, startPage, sectionPath, "list", false, totalTokens);
+            chunks.add(chunk);
+            return chunks;
+        }
+
+        // 大列表按项目拆分，每个 chunk 必须保留前导句
+        int chunkId = startChunkId;
+        int page = startPage;
+        List<String> currentItems = new ArrayList<>();
+        int currentTokens = leadTokens; // 从前导句的 token 数开始
+
+        for (JsonNode item : listItems) {
+            String itemText = item.path("content").asText("");
+            if (itemText.isBlank()) continue;
+
+            int itemTokens = estimateTokens(itemText);
+
+            // 如果加上这个 item 会超过限制
+            if (currentTokens + itemTokens > MAX_TOKEN_NORMAL && !currentItems.isEmpty()) {
+                // 保存当前 chunk，包含前导句
+                String chunkText = buildListChunkText(lead, currentItems);
+                int chunkTokens = leadTokens + currentItems.stream().mapToInt(this::estimateTokens).sum();
+                TextChunk chunk = new TextChunk(chunkId++, chunkText, page, sectionPath, "list", false, chunkTokens);
+                chunks.add(chunk);
+                page++;
+                currentItems.clear();
+                currentTokens = leadTokens; // 重置时也要包含前导句 token
+            }
+
+            currentItems.add(itemText);
+            currentTokens += itemTokens;
+        }
+
+        // 保存最后一个 chunk
+        if (!currentItems.isEmpty()) {
+            String chunkText = buildListChunkText(lead, currentItems);
+            int chunkTokens = leadTokens + currentItems.stream().mapToInt(this::estimateTokens).sum();
+            TextChunk chunk = new TextChunk(chunkId, chunkText, page, sectionPath, "list", false, chunkTokens);
+            chunks.add(chunk);
+        }
+
+        return chunks;
+    }
+
+    /**
+     * 解析表格 chunk
+     * V3: 小表格(≤300 token)整体为1个chunk，大表格按行切分每行带表头
+     */
+    private List<TextChunk> parseTableChunk(JsonNode item, String sectionPath, int startChunkId, int startPage) {
+        List<TextChunk> chunks = new ArrayList<>();
+
+        try {
+            List<String> rows = new ArrayList<>();
+            // 尝试多个可能的字段名
+            JsonNode rowsNode = item.path("rows");
+            if (!rowsNode.isArray()) rowsNode = item.path("data");
+            if (!rowsNode.isArray()) rowsNode = item.path("content");
+            if (rowsNode.isArray()) {
+                for (JsonNode row : rowsNode) {
+                    rows.add(row.asText());
+                }
+            }
+
+            if (rows.isEmpty()) {
+                log.debug("[MinerU] 表格解析失败: rows 为空");
+                return chunks;
+            }
+
+            // 前2行作为表头
+            int headerRowCount = Math.min(2, rows.size());
+            List<String> headerRows = rows.subList(0, headerRowCount);
+            String headerText = String.join("\n", headerRows);
+            int headerTokens = estimateTokens(headerText);
+
+            // 如果表格很小，整体作为一个 chunk
+            int totalTokens = estimateTokens(String.join("\n", rows));
+            if (totalTokens <= MAX_TOKEN_TABLE) {
+                String chunkText = String.join("\n", rows);
+                TextChunk chunk = new TextChunk(
+                        startChunkId,
+                        chunkText,
+                        startPage,
+                        sectionPath,
+                        "table",
+                        false,
+                        totalTokens
+                );
+                chunks.add(chunk);
+                return chunks;
+            }
+
+            // 大表格按行切分，每行带表头
+            List<String> dataRows = rows.subList(headerRowCount, rows.size());
+            List<String> currentRows = new ArrayList<>();
+            int currentTokens = headerTokens;
+            int page = startPage;
+            int chunkId = startChunkId;
+
+            for (String row : dataRows) {
+                int rowTokens = estimateTokens(row);
+                if (currentTokens + rowTokens > MAX_TOKEN_TABLE && !currentRows.isEmpty()) {
+                    // 保存当前 chunk，包含表头
+                    String chunkText = headerText + "\n" + String.join("\n", currentRows);
+                    TextChunk chunk = new TextChunk(chunkId++, chunkText, page, sectionPath, "table", false, currentTokens);
+                    chunks.add(chunk);
+                    page++;
+                    currentRows.clear();
+                    currentTokens = headerTokens;
+                }
+                currentRows.add(row);
+                currentTokens += rowTokens;
+            }
+
+            // 保存最后一个 chunk
+            if (!currentRows.isEmpty()) {
+                String chunkText = headerText + "\n" + String.join("\n", currentRows);
+                TextChunk chunk = new TextChunk(chunkId, chunkText, page, sectionPath, "table", false, currentTokens);
+                chunks.add(chunk);
+            }
+
+        } catch (Exception e) {
+            log.warn("[MinerU] 解析表格失败: {}", e.getMessage());
+        }
+
+        return chunks;
+    }
+
+    /**
+     * 解析列表 chunk
+     * V3: 前导句 + 列表项合并，过长则保留前导句拆分
+     */
+    private List<TextChunk> parseListChunk(JsonNode item, String sectionPath, int startChunkId, int startPage) {
+        List<TextChunk> chunks = new ArrayList<>();
+
+        // 尝试多个可能的字段名
+        String lead = item.path("lead").asText("");
+        if (lead.isBlank()) lead = item.path("heading").asText("");
+        if (lead.isBlank()) lead = item.path("content").asText("");
+
+        JsonNode itemsNode = item.path("items");
+        if (!itemsNode.isArray()) itemsNode = item.path("list");
+        if (!itemsNode.isArray()) itemsNode = item.path("content");
+        List<String> items = new ArrayList<>();
+        if (itemsNode.isArray()) {
+            for (JsonNode itemNode : itemsNode) {
+                items.add(itemNode.asText());
+            }
+        }
+
+        // 如果 items 也为空，可能是纯文本内容
+        if (items.isEmpty()) {
+            String textContent = item.path("content").asText("");
+            if (textContent.isBlank()) textContent = item.path("text").asText("");
+            if (!textContent.isBlank()) {
+                // 整个 item 作为 text 类型处理
+                TextChunk chunk = new TextChunk(startChunkId, textContent, startPage, sectionPath, "text", false, estimateTokens(textContent));
+                chunks.add(chunk);
+                return chunks;
+            }
+            return chunks;
+        }
+
+        // 构建完整列表文本
+        StringBuilder fullList = new StringBuilder();
+        if (!lead.isBlank()) {
+            fullList.append(lead).append("\n");
+        }
+        for (String listItem : items) {
+            fullList.append(listItem).append("\n");
+        }
+
+        String listText = fullList.toString().trim();
+        int totalTokens = estimateTokens(listText);
+
+        // 如果列表很小，整体作为一个 chunk
+        if (totalTokens <= MAX_TOKEN_NORMAL) {
+            TextChunk chunk = new TextChunk(startChunkId, listText, startPage, sectionPath, "list", false, totalTokens);
+            chunks.add(chunk);
+            return chunks;
+        }
+
+        // 大列表：前导句 + 部分列表项，过长则拆分但保留前导句
+        int chunkId = startChunkId;
+        int page = startPage;
+        List<String> currentItems = new ArrayList<>();
+        int currentTokens = estimateTokens(lead);
+        boolean leadAdded = false;
+
+        for (String listItem : items) {
+            int itemTokens = estimateTokens(listItem);
+
+            // 如果加上这个item会超过限制
+            if (currentTokens + itemTokens > MAX_TOKEN_NORMAL && !currentItems.isEmpty()) {
+                // 保存当前 chunk
+                String chunkText = buildListChunkText(lead, currentItems);
+                TextChunk chunk = new TextChunk(chunkId++, chunkText, page, sectionPath, "list", false, currentTokens);
+                chunks.add(chunk);
+                page++;
+                currentItems.clear();
+                currentTokens = estimateTokens(lead);
+                leadAdded = false;
+            }
+
+            currentItems.add(listItem);
+            currentTokens += itemTokens;
+        }
+
+        // 保存最后一个 chunk
+        if (!currentItems.isEmpty()) {
+            String chunkText = buildListChunkText(lead, currentItems);
+            TextChunk chunk = new TextChunk(chunkId, chunkText, page, sectionPath, "list", false, currentTokens);
+            chunks.add(chunk);
+        }
+
+        return chunks;
+    }
+
+    /**
+     * 构建列表 chunk 文本
+     */
+    private String buildListChunkText(String lead, List<String> items) {
+        StringBuilder sb = new StringBuilder();
+        if (!lead.isBlank()) {
+            sb.append(lead).append("\n");
+        }
+        for (String item : items) {
+            sb.append(item).append("\n");
+        }
+        return sb.toString().trim();
+    }
+
+    /**
+     * 按 section 切分文本，超长则递归细切
+     */
+    private List<TextChunk> splitSectionText(String text, String sectionPath, int maxTokens, int startChunkId, int startPage) {
+        List<TextChunk> chunks = new ArrayList<>();
+
+        if (text == null || text.isBlank()) {
+            return chunks;
+        }
+
+        int totalTokens = estimateTokens(text);
+
+        // 如果在限制内，直接返回
+        if (totalTokens <= maxTokens) {
+            TextChunk chunk = new TextChunk(startChunkId, text.trim(), startPage, sectionPath, "text", isKeyClauseText(text), totalTokens);
+            chunks.add(chunk);
+            return chunks;
+        }
+
+        // 超长 section，尝试按段落/子标题细分
+        String[] parts = text.split("\n(?=#)");
+        if (parts.length > 1) {
+            // 有子标题，递归处理每个子部分
+            int chunkId = startChunkId;
+            int page = startPage;
+            for (String part : parts) {
+                part = part.trim();
+                if (part.isEmpty()) continue;
+
+                List<TextChunk> subChunks = splitSectionText(part, sectionPath, maxTokens, chunkId, page);
+                chunks.addAll(subChunks);
+                if (!subChunks.isEmpty()) {
+                    chunkId = subChunks.get(subChunks.size() - 1).getChunkId() + 1;
+                    page = subChunks.get(subChunks.size() - 1).getPageNumber() + 1;
+                }
+            }
+            return chunks;
+        }
+
+        // 没有子标题，按句子级切分
+        return sentenceAwareSplit(text, sectionPath, maxTokens, startChunkId, startPage);
+    }
+
+    /**
+     * 句子级切分，避免在句子中间截断
+     */
+    private List<TextChunk> sentenceAwareSplit(String text, String sectionPath, int maxTokens, int startChunkId, int startPage) {
+        List<TextChunk> chunks = new ArrayList<>();
+
+        // 按句子分割
+        String[] sentences = text.split("(?<=[。！？；])|(?<=[.!?;])\\s+");
+
+        StringBuilder currentChunk = new StringBuilder();
+        int currentTokens = 0;
+        int chunkId = startChunkId;
+        int page = startPage;
+
+        for (String sentence : sentences) {
+            sentence = sentence.trim();
+            if (sentence.isEmpty()) continue;
+
+            int sentenceTokens = estimateTokens(sentence);
+
+            // 如果单个句子就超过限制，按词切
+            if (sentenceTokens > maxTokens) {
+                if (currentChunk.length() > 0) {
+                    chunks.add(new TextChunk(chunkId++, currentChunk.toString().trim(), page, sectionPath, "text", isKeyClauseText(currentChunk.toString()), currentTokens));
+                    currentChunk = new StringBuilder();
+                    currentTokens = 0;
+                    page++;
+                }
+                // 按词分割超长句子
+                chunks.addAll(splitLongSentence(sentence, sectionPath, maxTokens, chunkId, page));
+                if (!chunks.isEmpty()) {
+                    chunkId = chunks.get(chunks.size() - 1).getChunkId() + 1;
+                    page = chunks.get(chunks.size() - 1).getPageNumber() + 1;
+                }
+                continue;
+            }
+
+            // 如果添加这个句子会超过限制
+            if (currentTokens + sentenceTokens > maxTokens && currentChunk.length() > 0) {
+                chunks.add(new TextChunk(chunkId++, currentChunk.toString().trim(), page, sectionPath, "text", isKeyClauseText(currentChunk.toString()), currentTokens));
+                currentChunk = new StringBuilder();
+                currentTokens = 0;
+                page++;
+            }
+
+            if (currentChunk.length() > 0) {
+                currentChunk.append(" ");
+            }
+            currentChunk.append(sentence);
+            currentTokens += sentenceTokens;
+        }
+
+        // 保存最后一个 chunk
+        if (currentChunk.length() > 0) {
+            chunks.add(new TextChunk(chunkId, currentChunk.toString().trim(), page, sectionPath, "text", isKeyClauseText(currentChunk.toString()), currentTokens));
+        }
+
+        return chunks;
+    }
+
+    /**
+     * 分割超长句子
+     */
+    private List<TextChunk> splitLongSentence(String sentence, String sectionPath, int maxTokens, int startChunkId, int startPage) {
+        List<TextChunk> chunks = new ArrayList<>();
+
+        // 按标点或常见分隔符切分
+        String[] parts = sentence.split("(?<=[,，、:：;；])");
+        StringBuilder currentChunk = new StringBuilder();
+        int currentTokens = 0;
+        int chunkId = startChunkId;
+        int page = startPage;
+
+        for (String part : parts) {
+            part = part.trim();
+            if (part.isEmpty()) continue;
+
+            int partTokens = estimateTokens(part);
+
+            if (currentTokens + partTokens > maxTokens && currentChunk.length() > 0) {
+                chunks.add(new TextChunk(chunkId++, currentChunk.toString().trim(), page, sectionPath, "text", false, currentTokens));
+                currentChunk = new StringBuilder();
+                currentTokens = 0;
+                page++;
+            }
+
+            if (currentChunk.length() > 0) {
+                currentChunk.append(" ");
+            }
+            currentChunk.append(part);
+            currentTokens += partTokens;
+        }
+
+        if (currentChunk.length() > 0) {
+            chunks.add(new TextChunk(chunkId, currentChunk.toString().trim(), page, sectionPath, "text", false, currentTokens));
+        }
+
+        return chunks;
+    }
+
+    /**
+     * 构建层级路径
+     */
+    private String buildSectionPath(String parentPath, String currentTitle, int level) {
+        if (currentTitle == null || currentTitle.isBlank()) {
+            return parentPath;
+        }
+        if (parentPath.isEmpty()) {
+            return currentTitle;
+        }
+        // 根据 level 决定是替换同级别还是追加
+        return parentPath + " > " + currentTitle;
+    }
+
+    /**
+     * 根据标题判断是否关键条款
+     */
+    private boolean isKeyClauseTitle(String title) {
+        if (title == null) return false;
+        for (String keyword : KEY_CLAUSE_KEYWORDS) {
+            if (title.contains(keyword)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * 根据文本内容判断是否关键条款
+     */
+    private boolean isKeyClauseText(String text) {
+        if (text == null) return false;
+        int matchCount = 0;
+        for (String keyword : KEY_CLAUSE_KEYWORDS) {
+            if (text.contains(keyword)) {
+                matchCount++;
+            }
+        }
+        // 文本中出现多个关键词才认为是关键条款
+        return matchCount >= 2;
+    }
+
+    /**
+     * 估算 token 数（中文按字符估算，英文按单词估算）
+     */
+    private int estimateTokens(String text) {
+        if (text == null || text.isBlank()) {
+            return 0;
+        }
+        // 简单估算：中文每个字符约1个token，英文每个单词约1.5个token
+        int chineseChars = (int) text.chars().filter(c -> c >= 0x4E00 && c <= 0x9FA5).count();
+        int englishWords = text.split("[\\u4E00-\\u9FA5]").length;
+        return chineseChars + (int) (englishWords * 1.5);
+    }
+
+    /**
+     * 串联相邻 chunks 的 prev/next
+     */
+    private void linkNeighboringChunks(List<TextChunk> chunks) {
+        for (int i = 0; i < chunks.size(); i++) {
+            TextChunk chunk = chunks.get(i);
+            if (i > 0) {
+                chunk.setPrevChunkId(String.valueOf(chunks.get(i - 1).getChunkId()));
+            }
+            if (i < chunks.size() - 1) {
+                chunk.setNextChunkId(String.valueOf(chunks.get(i + 1).getChunkId()));
+            }
+        }
+    }
+
+    /**
+     * 使用 fullMd 降级解析（当 content_list_v2.json 不可用时）
+     */
+    private List<TextChunk> parseMarkdownFallback(String fullMd) {
+        if (fullMd == null || fullMd.isBlank()) {
+            log.warn("[MinerU] fullMd 为空，无法降级解析");
+            return new ArrayList<>();
+        }
+        log.debug("[MinerU] 使用 fullMd 降级解析，fullMd 长度: {}", fullMd.length());
+        List<TextChunk> result = parseMarkdownToChunks(fullMd);
+        log.debug("[MinerU] fullMd 降级解析完成，生成 {} 个 chunks", result.size());
+        return result;
+    }
+
     /**
      * 申请上传链接结果
      */
-    @Data
     public static class BatchApplyResult {
         private final String batchId;
         private final String uploadUrl;
@@ -392,71 +1655,611 @@ public class MinerUService {
             this.batchId = batchId;
             this.uploadUrl = uploadUrl;
         }
+
+        public String getBatchId() { return batchId; }
+        public String getUploadUrl() { return uploadUrl; }
     }
 
     /**
      * MinerU 解析结果
      */
-    @Data
     public static class MinerUParseResult {
-        /** 完整 Markdown 内容 */
         private String fullMd;
-
-        /** content_list_v2.json 内容 */
         private String contentJson;
-
-        /** layout.json 内容 */
         private String layoutJson;
-
-        /** MinerU batch_id */
         private String mineruBatchId;
-
-        /** 解析状态 SUCCESS/FAILED */
         private String parseStatus;
-
-        /** 解析错误信息 */
         private String parseError;
-
-        /** 文本块列表 */
         private List<TextChunk> chunks;
+
+        // Getters
+        public String getFullMd() { return fullMd; }
+        public String getContentJson() { return contentJson; }
+        public String getLayoutJson() { return layoutJson; }
+        public String getMineruBatchId() { return mineruBatchId; }
+        public String getParseStatus() { return parseStatus; }
+        public String getParseError() { return parseError; }
+        public List<TextChunk> getChunks() { return chunks; }
+
+        // Setters
+        public void setFullMd(String fullMd) { this.fullMd = fullMd; }
+        public void setContentJson(String contentJson) { this.contentJson = contentJson; }
+        public void setLayoutJson(String layoutJson) { this.layoutJson = layoutJson; }
+        public void setMineruBatchId(String mineruBatchId) { this.mineruBatchId = mineruBatchId; }
+        public void setParseStatus(String parseStatus) { this.parseStatus = parseStatus; }
+        public void setParseError(String parseError) { this.parseError = parseError; }
+        public void setChunks(List<TextChunk> chunks) { this.chunks = chunks; }
     }
 
     /**
-     * 文本块
+     * V3 文本块，包含丰富的 metadata
      */
-    @Data
     public static class TextChunk {
-        /** 块序号 */
         private int chunkId;
-
-        /** 文本内容 */
         private String content;
-
-        /** 页码（从 Markdown 中估算） */
         private int pageNumber;
-
-        /** 所属标题（用于引用来源） */
         private String heading;
+        private String sectionPath;
+        private String chunkType;
+        private boolean isKeyClause;
+        private int tokenCount;
+        private String prevChunkId;
+        private String nextChunkId;
 
         public TextChunk(int chunkId, String content, int pageNumber, String heading) {
             this.chunkId = chunkId;
             this.content = content;
             this.pageNumber = pageNumber;
             this.heading = heading;
+            this.sectionPath = null;
+            this.chunkType = "text";
+            this.isKeyClause = false;
+            this.tokenCount = estimateTokensStatic(content);
         }
 
-        /**
-         * 生成锚文本（前 120 字符）
-         */
+        public TextChunk(int chunkId, String content, int pageNumber, String sectionPath,
+                         String chunkType, boolean isKeyClause, int tokenCount) {
+            this.chunkId = chunkId;
+            this.content = content;
+            this.pageNumber = pageNumber;
+            this.heading = sectionPath;
+            this.sectionPath = sectionPath;
+            this.chunkType = chunkType != null ? chunkType : "text";
+            this.isKeyClause = isKeyClause;
+            this.tokenCount = tokenCount;
+        }
+
+        // Getters
+        public int getChunkId() { return chunkId; }
+        public String getContent() { return content; }
+        public int getPageNumber() { return pageNumber; }
+        public String getHeading() { return heading; }
+        public String getSectionPath() { return sectionPath; }
+        public String getChunkType() { return chunkType; }
+        public boolean isKeyClause() { return isKeyClause; }
+        public int getTokenCount() { return tokenCount; }
+        public String getPrevChunkId() { return prevChunkId; }
+        public String getNextChunkId() { return nextChunkId; }
+
+        // Setters
+        public void setChunkId(int chunkId) { this.chunkId = chunkId; }
+        public void setContent(String content) { this.content = content; }
+        public void setPageNumber(int pageNumber) { this.pageNumber = pageNumber; }
+        public void setHeading(String heading) { this.heading = heading; }
+        public void setSectionPath(String sectionPath) { this.sectionPath = sectionPath; }
+        public void setChunkType(String chunkType) { this.chunkType = chunkType; }
+        public void setKeyClause(boolean keyClause) { isKeyClause = keyClause; }
+        public void setTokenCount(int tokenCount) { this.tokenCount = tokenCount; }
+        public void setPrevChunkId(String prevChunkId) { this.prevChunkId = prevChunkId; }
+        public void setNextChunkId(String nextChunkId) { this.nextChunkId = nextChunkId; }
+
         public String getAnchorText() {
-            if (content == null) {
-                return "";
-            }
+            if (content == null) return "";
             String text = content.replace("\n", " ").trim();
-            if (text.length() <= 120) {
-                return text;
-            }
+            if (text.length() <= 120) return text;
             return text.substring(0, 120);
         }
+
+        private static int estimateTokensStatic(String text) {
+            if (text == null || text.isBlank()) return 0;
+            int chineseChars = (int) text.chars().filter(c -> c >= 0x4E00 && c <= 0x9FA5).count();
+            int englishWords = text.split("[\u4E00-\u9FA5]").length;
+            return chineseChars + (int) (englishWords * 1.5);
+        }
+    }
+
+    // ==================== 两阶段表格解析 (按 mineru_two_stage_rebinding_plan.md) ====================
+
+    /**
+     * 阶段 1：第一次扫描 - 提取所有 TableObject
+     *
+     * 目标：收集证据，不做最终表类型判定
+     */
+    private List<TableObject> extractTableObjects(JsonNode contentList) {
+        List<TableObject> tableObjects = new ArrayList<>();
+
+        if (!contentList.isArray()) {
+            log.warn("[MinerU] extractTableObjects: contentList 不是数组");
+            return tableObjects;
+        }
+
+        // 遍历每一页
+        for (int pageIdx = 0; pageIdx < contentList.size(); pageIdx++) {
+            JsonNode pageBlocks = contentList.get(pageIdx);
+            if (!pageBlocks.isArray()) continue;
+
+            int pageNum = pageIdx + 1;
+            List<String> prevTexts = new ArrayList<>();  // 追踪前一个文本块
+
+            // 遍历当前页的每个块
+            for (int blockIdx = 0; blockIdx < pageBlocks.size(); blockIdx++) {
+                JsonNode block = pageBlocks.get(blockIdx);
+                String type = block.path("type").asText("");
+
+                // 收集 paragraph/title 作为 prevTexts
+                if ("paragraph".equals(type) || "title".equals(type)) {
+                    String text = extractTextFromV2Block(type, block.path("content"));
+                    if (!text.isBlank() && text.length() < 100) {
+                        prevTexts.add(text);
+                    }
+                }
+
+                // 只处理 table 类型
+                if (!"table".equals(type)) continue;
+
+                JsonNode contentObj = block.path("content");
+                String tableId = String.format("p%d_t%d", pageNum, blockIdx);
+
+                // 提取 rawCaption
+                List<String> rawCaption = new ArrayList<>();
+                JsonNode captionNode = contentObj.path("table_caption");
+                if (captionNode.isArray()) {
+                    for (JsonNode cn : captionNode) {
+                        String text = cn.path("content").asText("");
+                        if (!text.isBlank()) {
+                            rawCaption.add(text);
+                        }
+                    }
+                }
+
+                // 提取 rawFootnote
+                List<String> rawFootnote = new ArrayList<>();
+                JsonNode footnoteNode = contentObj.path("table_footnote");
+                if (footnoteNode.isArray()) {
+                    for (JsonNode fn : footnoteNode) {
+                        String text = fn.path("content").asText("");
+                        if (!text.isBlank()) {
+                            rawFootnote.add(text);
+                        }
+                    }
+                }
+
+                // 提取 bbox
+                List<Integer> bbox = new ArrayList<>();
+                JsonNode bboxNode = block.path("bbox");
+                if (bboxNode.isArray()) {
+                    for (JsonNode b : bboxNode) {
+                        bbox.add(b.asInt(0));
+                    }
+                }
+
+                // 提取 HTML 并解析
+                String rawHtml = contentObj.path("html").asText("");
+                List<List<String>> tableMatrix = parseHtmlToMatrix(rawHtml);
+
+                // 提取 headerCandidates (第一行)
+                List<String> headerCandidates = new ArrayList<>();
+                if (!tableMatrix.isEmpty()) {
+                    headerCandidates = tableMatrix.get(0);
+                }
+
+                // 提取 rowLabels (第一列，从第二行开始)
+                List<String> rowLabels = new ArrayList<>();
+                List<String> yearColumns = new ArrayList<>();
+                for (int i = 1; i < tableMatrix.size(); i++) {
+                    List<String> row = tableMatrix.get(i);
+                    if (!row.isEmpty()) {
+                        rowLabels.add(row.get(0));
+                        // 识别年份列（如果第一行是年份）
+                        if (i == 1 && headerCandidates.size() > 1) {
+                            for (int j = 1; j < headerCandidates.size(); j++) {
+                                String col = headerCandidates.get(j);
+                                if (col.matches("\\d{4}[A-Z]?") || col.matches("\\d{4}")) {
+                                    yearColumns.add(col);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // 构建 TableObject
+                TableObject tableObject = TableObject.builder()
+                        .tableId(tableId)
+                        .page(pageNum)
+                        .blockIndex(blockIdx)
+                        .rawCaption(rawCaption)
+                        .rawFootnote(rawFootnote)
+                        .prevTexts(new ArrayList<>(prevTexts))
+                        .nextTexts(new ArrayList<>())
+                        .rawHtml(rawHtml)
+                        .headerCandidates(headerCandidates)
+                        .rowLabels(rowLabels)
+                        .yearColumns(yearColumns.isEmpty() ? Arrays.asList("2022", "2023E", "2024E", "2025E") : yearColumns)
+                        .rowCount(tableMatrix.size())
+                        .columnCount(tableMatrix.isEmpty() ? 0 : tableMatrix.get(0).size())
+                        .bbox(bbox)
+                        .tableMatrix(tableMatrix)
+                        .build();
+
+                tableObjects.add(tableObject);
+                log.info("[MinerU] 阶段1: 提取 TableObject {}, caption={}, 行数={}, 列数={}",
+                        tableId, rawCaption, tableObject.getRowCount(), tableObject.getColumnCount());
+
+                // 清空 prevTexts，因为已经用于当前表
+                prevTexts.clear();
+            }
+        }
+
+        log.info("[MinerU] 阶段1: 共提取 {} 个 TableObject", tableObjects.size());
+        return tableObjects;
+    }
+
+    /**
+     * 将 HTML 表格解析为二维矩阵
+     */
+    private List<List<String>> parseHtmlToMatrix(String html) {
+        List<List<String>> matrix = new ArrayList<>();
+        if (html == null || html.isBlank()) return matrix;
+
+        try {
+            Pattern rowPattern = Pattern.compile("<tr[^>]*>(.*?)</tr>", Pattern.DOTALL | Pattern.CASE_INSENSITIVE);
+            Matcher rowMatcher = rowPattern.matcher(html);
+
+            while (rowMatcher.find()) {
+                String rowContent = rowMatcher.group(1);
+                Pattern cellPattern = Pattern.compile("<t[hd][^>]*>(.*?)</t[hd]>", Pattern.DOTALL | Pattern.CASE_INSENSITIVE);
+                Matcher cellMatcher = cellPattern.matcher(rowContent);
+
+                List<String> cells = new ArrayList<>();
+                while (cellMatcher.find()) {
+                    String cellText = cellMatcher.group(1)
+                            .replaceAll("<[^>]+>", "")
+                            .replaceAll("\\s+", " ")
+                            .trim();
+                    cells.add(cellText);
+                }
+                if (!cells.isEmpty()) {
+                    matrix.add(cells);
+                }
+            }
+        } catch (Exception e) {
+            log.warn("[MinerU] HTML 表格解析失败: {}", e.getMessage());
+        }
+
+        return matrix;
+    }
+
+    /**
+     * 阶段 2：LLM 表分类
+     *
+     * 对每张表做类型判断，输出受约束的 JSON 结果
+     */
+    private List<TableClassificationResult> classifyTablesWithLLM(List<TableObject> tableObjects) {
+        List<TableClassificationResult> results = new ArrayList<>();
+
+        for (TableObject table : tableObjects) {
+            try {
+                // 构建 LLM 输入
+                String llmInput = buildLLMClassificationInput(table);
+                log.info("[MinerU] 阶段2: 正在分类表 {}, 输入长度={}", table.getTableId(), llmInput.length());
+
+                // 调用 LLM (使用 DeepSeek API)
+                String llmOutput = callLLMForClassification(llmInput);
+                log.debug("[MinerU] 阶段2: LLM 输出: {}", llmOutput);
+
+                // 解析 LLM 输出
+                TableClassificationResult result = parseLLMClassificationOutput(llmOutput, table.getTableId());
+                results.add(result);
+
+                log.info("[MinerU] 阶段2: 表 {} 分类为 {}, 置信度={}, resolvedTitle={}",
+                        table.getTableId(), result.getPredictedType(), result.getConfidence(), result.getResolvedTitle());
+
+            } catch (Exception e) {
+                log.warn("[MinerU] 阶段2: 表 {} LLM 分类失败: {}, 标记为未知", table.getTableId(), e.getMessage());
+                results.add(TableClassificationResult.builder()
+                        .tableId(table.getTableId())
+                        .predictedType("未知")
+                        .confidence(0.0)
+                        .evidence(new ArrayList<>())
+                        .rawCaptionConflict(false)
+                        .resolvedTitle("未知")
+                        .notes("LLM 分类失败: " + e.getMessage())
+                        .build());
+            }
+        }
+
+        return results;
+    }
+
+    /**
+     * 构建 LLM 分类输入
+     */
+    private String buildLLMClassificationInput(TableObject table) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("请分析以下表格，根据表格内容（行标签、表头、原始caption）判断其类型或主题。\n\n");
+        sb.append("【表格信息】\n");
+        sb.append("- 表格ID: ").append(table.getTableId()).append("\n");
+        sb.append("- 原始Caption: ").append(table.getRawCaption().isEmpty() ? "(空)" : String.join(" / ", table.getRawCaption())).append("\n");
+        sb.append("- 前导文本: ").append(table.getPrevTexts().isEmpty() ? "(空)" : String.join(", ", table.getPrevTexts())).append("\n");
+        sb.append("- 表头行: ").append(table.getHeaderCandidates().isEmpty() ? "(空)" : String.join(" | ", table.getHeaderCandidates())).append("\n");
+        sb.append("- 年份列: ").append(String.join(" | ", table.getYearColumns())).append("\n");
+        sb.append("- 行标签(最多20个): ").append(table.getRowLabels().stream().limit(20).toList()).append("\n\n");
+        sb.append("【输出要求】\n");
+        sb.append("请输出严格JSON格式：\n");
+        sb.append("{\"predictedType\":\"根据内容推断的表格类型(如:利润表、学生成绩表、课程表、库存清单等)\",");
+        sb.append("\"confidence\":0.0-1.0,");
+        sb.append("\"evidence\":[\"判断依据1\",\"判断依据2\"],");
+        sb.append("\"rawCaptionConflict\":true/false(原始caption是否与内容不符),");
+        sb.append("\"resolvedTitle\":\"最终确定的标题\",");
+        sb.append("\"notes\":\"备注说明\"}\n\n");
+        sb.append("要求：必须引用 rowLabels 或 headerCandidates 中的具体内容作为 evidence，不允许凭空判断。");
+        return sb.toString();
+    }
+
+    /**
+     * 调用 LLM 进行表格分类（使用真实 DeepSeek API）
+     */
+    private String callLLMForClassification(String input) throws Exception {
+        String systemPrompt = "你是一个专业的表格类型分析助手。根据表格内容判断其类型，输出符合要求的JSON格式。";
+        try {
+            return deepSeekClient.callSync(input, systemPrompt);
+        } catch (Exception e) {
+            log.warn("[MinerU] 阶段2: LLM API 调用失败: {}, 使用降级方案", e.getMessage());
+            return generateFallbackClassification(input);
+        }
+    }
+
+    /**
+     * 生成降级分类结果（当 LLM API 不可用时）
+     * 注意：这是临时方案，应该接入真实 LLM API
+     */
+    private String generateFallbackClassification(String input) {
+        // 基于规则的简单分类（仅用于降级）
+        // 实际应该调用 LLM API
+        String rowLabels = input.contains("经营活动产生现金流量") || input.contains("投资活动产生现金流量") ? "现金流量表" :
+                input.contains("营业收入") || input.contains("营业成本") || input.contains("净利润") ? "利润表" :
+                        input.contains("流动资产") || input.contains("非流动资产") || input.contains("负债合计") ? "资产负债表" :
+                                "未知";
+
+        String caption = input.contains("利润表") ? "利润表" :
+                input.contains("现金") ? "现金流量表" :
+                        input.contains("资产") ? "资产负债表" : "";
+
+        String conflict = (!caption.isEmpty() && !rowLabels.equals(caption) && !"未知".equals(rowLabels)) ? "true" : "false";
+
+        return String.format(
+                "{\"predictedType\":\"%s\",\"confidence\":0.75,\"evidence\":[\"基于行标签特征判断\"],\"rawCaptionConflict\":%s,\"resolvedTitle\":\"%s\",\"notes\":\"降级结果，需接入LLM API\"}",
+                rowLabels, conflict, rowLabels
+        );
+    }
+
+    /**
+     * 解析 LLM 分类输出
+     */
+    private TableClassificationResult parseLLMClassificationOutput(String jsonOutput, String tableId) {
+        try {
+            JsonNode node = objectMapper.readTree(jsonOutput);
+
+            String predictedType = node.path("predictedType").asText("未知");
+            // LLM 自由判断，不限制类型
+            if (predictedType.isBlank() || "null".equals(predictedType)) {
+                predictedType = "未知";
+            }
+
+            double confidence = node.path("confidence").asDouble(0.0);
+            boolean rawCaptionConflict = node.path("rawCaptionConflict").asBoolean(false);
+            String resolvedTitle = node.path("resolvedTitle").asText(predictedType);
+            String notes = node.path("notes").asText("");
+
+            List<String> evidence = new ArrayList<>();
+            JsonNode evidenceNode = node.path("evidence");
+            if (evidenceNode.isArray()) {
+                for (JsonNode e : evidenceNode) {
+                    evidence.add(e.asText());
+                }
+            }
+
+            return TableClassificationResult.builder()
+                    .tableId(tableId)
+                    .predictedType(predictedType)
+                    .confidence(confidence)
+                    .evidence(evidence)
+                    .rawCaptionConflict(rawCaptionConflict)
+                    .resolvedTitle(resolvedTitle)
+                    .notes(notes)
+                    .build();
+
+        } catch (Exception e) {
+            log.warn("[MinerU] 阶段2: 解析 LLM 输出失败: {}, json={}", e.getMessage(), jsonOutput);
+            return TableClassificationResult.builder()
+                    .tableId(tableId)
+                    .predictedType("未知")
+                    .confidence(0.0)
+                    .evidence(new ArrayList<>())
+                    .rawCaptionConflict(false)
+                    .resolvedTitle("未知")
+                    .notes("解析失败: " + e.getMessage())
+                    .build();
+        }
+    }
+
+    /**
+     * 阶段 3：全局一致性约束
+     *
+     * 防止 LLM 在局部正确、全局冲突
+     */
+    private List<TableClassificationResult> applyGlobalConsistency(List<TableClassificationResult> results) {
+        log.info("[MinerU] 阶段3: 开始全局一致性约束，原始结果数={}", results.size());
+
+        // 统计各类型数量
+        Map<String, List<TableClassificationResult>> typeGroups = new java.util.HashMap<>();
+        for (TableClassificationResult r : results) {
+            typeGroups.computeIfAbsent(r.getPredictedType(), k -> new ArrayList<>()).add(r);
+        }
+
+        // 检查每种类型是否有多个高置信候选
+        for (Map.Entry<String, List<TableClassificationResult>> entry : typeGroups.entrySet()) {
+            String type = entry.getKey();
+            List<TableClassificationResult> candidates = entry.getValue();
+
+            if (candidates.size() > 1) {
+                // 找最高置信度
+                candidates.sort((a, b) -> Double.compare(b.getConfidence(), a.getConfidence()));
+
+                // 保留最高置信度者，其他降级
+                for (int i = 1; i < candidates.size(); i++) {
+                    TableClassificationResult r = candidates.get(i);
+                    if (r.getConfidence() < 0.90) {
+                        log.info("[MinerU] 阶段3: 类型 {} 有多个候选，降级表 {} (confidence={})",
+                                type, r.getTableId(), r.getConfidence());
+                        r.setPredictedType("未知");
+                        r.setResolvedTitle("未知");
+                        r.setNotes(r.getNotes() + "; 全局约束降级");
+                    }
+                }
+            }
+        }
+
+        // 低置信度降级
+        double CONFIDENCE_THRESHOLD = 0.70;
+        for (TableClassificationResult r : results) {
+            if (r.getConfidence() < CONFIDENCE_THRESHOLD && !"未知".equals(r.getPredictedType())) {
+                log.info("[MinerU] 阶段3: 表 {} 置信度 {} < {}, 降级为未知",
+                        r.getTableId(), r.getConfidence(), CONFIDENCE_THRESHOLD);
+                r.setPredictedType("未知");
+                r.setResolvedTitle("未知");
+                r.setNotes(r.getNotes() + "; 低置信度降级");
+            }
+        }
+
+        log.info("[MinerU] 阶段3: 全局一致性约束完成");
+        return results;
+    }
+
+    /**
+     * 阶段 4：结构化行抽取
+     *
+     * 对已分类的财务主表做二次扫描，提取行级记录
+     */
+    private List<StructuredFinancialRow> extractStructuredRows(
+            TableObject table,
+            TableClassificationResult classification) {
+
+        List<StructuredFinancialRow> rows = new ArrayList<>();
+
+        // 只处理结构化表（由 shouldExtractAsStructured 保证）
+        if (!shouldExtractAsStructured(classification)) {
+            log.debug("[MinerU] 阶段4: 表 {} 类型 {} 置信度 {} 不足，跳过结构化抽取",
+                    table.getTableId(), classification.getPredictedType(), classification.getConfidence());
+            return rows;
+        }
+
+        List<List<String>> matrix = table.getTableMatrix();
+        if (matrix.isEmpty() || matrix.size() < 2) {
+            log.warn("[MinerU] 阶段4: 表 {} 矩阵为空或只有表头，跳过", table.getTableId());
+            return rows;
+        }
+
+        // 提取年份列（从第一行）
+        List<String> years = new ArrayList<>();
+        if (!matrix.get(0).isEmpty()) {
+            for (int i = 1; i < matrix.get(0).size(); i++) {
+                years.add(matrix.get(0).get(i));
+            }
+        }
+        if (years.isEmpty()) {
+            years = table.getYearColumns();
+        }
+
+        // 提取单位（从 footnote）
+        String unit = "百万元";
+        for (String fn : table.getRawFootnote()) {
+            if (fn.contains("百万")) unit = "百万元";
+            else if (fn.contains("千")) unit = "千元";
+            else if (fn.contains("万")) unit = "万元";
+            else if (fn.contains("亿")) unit = "亿元";
+        }
+
+        // 遍历数据行
+        for (int i = 1; i < matrix.size(); i++) {
+            List<String> row = matrix.get(i);
+            if (row.isEmpty()) continue;
+
+            String rowLabel = row.get(0);
+            if (rowLabel.isBlank()) continue;
+
+            // 遍历年份列
+            for (int j = 1; j < row.size() && j <= years.size(); j++) {
+                String year = years.get(j - 1);
+                String value = row.get(j);
+
+                StructuredFinancialRow record = StructuredFinancialRow.builder()
+                        .tableId(table.getTableId())
+                        .page(table.getPage())
+                        .statementType(classification.getResolvedTitle())
+                        .year(year)
+                        .item(rowLabel)
+                        .value(value)
+                        .unit(unit)
+                        .confidence(classification.getConfidence())
+                        .sourceCaption(String.join("/", table.getRawCaption()))
+                        .rawRowLabel(rowLabel)
+                        .build();
+
+                rows.add(record);
+            }
+        }
+
+        log.info("[MinerU] 阶段4: 表 {} 提取 {} 条结构化记录", table.getTableId(), rows.size());
+        return rows;
+    }
+
+    /**
+     * 判断是否为结构化数据表
+     * 规则：置信度 >= 0.6 的非"未知"类型表，都值得尝试结构化抽取
+     */
+    private boolean shouldExtractAsStructured(TableClassificationResult classification) {
+        if (classification == null) {
+            return false;
+        }
+        String type = classification.getPredictedType();
+        double confidence = classification.getConfidence();
+
+        // 未知类型不进行结构化抽取
+        if ("未知".equals(type)) {
+            return false;
+        }
+
+        // 高置信度表进行结构化抽取
+        return confidence >= 0.6;
+    }
+
+    /**
+     * 阶段 5：结构化表查询
+     *
+     * 当用户查询表格数据时，直接走结构化记录查询
+     * 支持任意类型的结构化表格（财务报表、学生成绩表、库存表等）
+     */
+    public List<StructuredFinancialRow> queryStructuredData(
+            String tableType,
+            String rowLabel,
+            String columnHeader,
+            List<String> items) {
+
+        // TODO: 从数据库或缓存中查询结构化记录
+        // 目前返回空列表，后续接入存储层
+        log.info("[MinerU] 阶段5: 查询结构化数据 tableType={}, rowLabel={}, columnHeader={}, items={}",
+                tableType, rowLabel, columnHeader, items);
+        return new ArrayList<>();
     }
 }

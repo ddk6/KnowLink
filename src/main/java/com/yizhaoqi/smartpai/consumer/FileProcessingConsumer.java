@@ -2,9 +2,11 @@ package com.yizhaoqi.smartpai.consumer;
 
 import com.yizhaoqi.smartpai.config.KafkaConfig;
 import com.yizhaoqi.smartpai.config.MinerUProperties;
+import com.yizhaoqi.smartpai.model.DocumentVector;
 import com.yizhaoqi.smartpai.model.FileProcessingTask;
 import com.yizhaoqi.smartpai.model.FileUpload;
 import com.yizhaoqi.smartpai.model.MinerUParseResult;
+import com.yizhaoqi.smartpai.repository.DocumentVectorRepository;
 import com.yizhaoqi.smartpai.repository.FileUploadRepository;
 import com.yizhaoqi.smartpai.repository.MinerUParseResultRepository;
 import com.yizhaoqi.smartpai.service.MinerUService;
@@ -33,6 +35,7 @@ public class FileProcessingConsumer {
     private final VectorizationService vectorizationService;
     private final FileUploadRepository fileUploadRepository;
     private final MinerUParseResultRepository mineruParseResultRepository;
+    private final DocumentVectorRepository documentVectorRepository;
     private final MinerUService minerUService;
     private final MinerUProperties minerUProperties;
     @Autowired
@@ -44,6 +47,7 @@ public class FileProcessingConsumer {
             VectorizationService vectorizationService,
             FileUploadRepository fileUploadRepository,
             MinerUParseResultRepository mineruParseResultRepository,
+            DocumentVectorRepository documentVectorRepository,
             MinerUService minerUService,
             MinerUProperties minerUProperties
     ) {
@@ -51,6 +55,7 @@ public class FileProcessingConsumer {
         this.vectorizationService = vectorizationService;
         this.fileUploadRepository = fileUploadRepository;
         this.mineruParseResultRepository = mineruParseResultRepository;
+        this.documentVectorRepository = documentVectorRepository;
         this.minerUService = minerUService;
         this.minerUProperties = minerUProperties;
     }
@@ -117,10 +122,13 @@ public class FileProcessingConsumer {
                     task.getFileMd5()
             );
 
-            // 3. 保存 MinerU 解析结果
+            // 3. 保存 MinerU 解析结果到 mineru_parse_result 表
             saveMinerUResult(task.getFileMd5(), parseResult);
 
-            // 4. 向量化处理
+            // 4. V3: 保存 chunks 到 document_vectors 表（带 V3 metadata）
+            saveMinerUChunksToDocumentVector(task, parseResult);
+
+            // 5. 向量化处理
             VectorizationService.VectorizationUsageResult vectorizationResult = vectorizationService.vectorizeWithUsage(
                     task.getFileMd5(),
                     task.getUserId(),
@@ -132,13 +140,49 @@ public class FileProcessingConsumer {
             log.info("[MinerU] 向量化完成: fileMd5={}", task.getFileMd5());
 
         } finally {
-            // 5. 清理临时文件
+            // 6. 清理临时文件
             try {
                 Files.deleteIfExists(filePath);
             } catch (IOException e) {
                 log.warn("[MinerU] 清理临时文件失败: {}", filePath);
             }
         }
+    }
+
+    /**
+     * V3: 将 MinerU chunks 保存到 document_vectors 表（带 V3 metadata）
+     */
+    private void saveMinerUChunksToDocumentVector(FileProcessingTask task, MinerUService.MinerUParseResult parseResult) {
+        if (parseResult.getChunks() == null || parseResult.getChunks().isEmpty()) {
+            log.warn("[MinerU] MinerU 返回的 chunks 为空，跳过保存: fileMd5={}", task.getFileMd5());
+            return;
+        }
+
+        log.info("[MinerU] 开始保存 {} 个 chunks 到 document_vectors: fileMd5={}",
+                parseResult.getChunks().size(), task.getFileMd5());
+
+        for (MinerUService.TextChunk minerUChunk : parseResult.getChunks()) {
+            DocumentVector vector = new DocumentVector();
+            vector.setFileMd5(task.getFileMd5());
+            vector.setChunkId(minerUChunk.getChunkId());
+            vector.setTextContent(minerUChunk.getContent());
+            vector.setPageNumber(minerUChunk.getPageNumber());
+            vector.setAnchorText(minerUChunk.getAnchorText());
+            vector.setUserId(task.getUserId());
+            vector.setOrgTag(task.getOrgTag());
+            vector.setPublic(task.isPublic());
+
+            // V3 metadata
+            vector.setSectionPath(minerUChunk.getSectionPath());
+            vector.setChunkType(minerUChunk.getChunkType());
+            vector.setKeyClause(minerUChunk.isKeyClause());
+            vector.setTokenCount(minerUChunk.getTokenCount());
+
+            documentVectorRepository.save(vector);
+        }
+
+        log.info("[MinerU] 保存 chunks 完成: fileMd5={}, count={}",
+                task.getFileMd5(), parseResult.getChunks().size());
     }
 
     /**

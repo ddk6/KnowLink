@@ -118,7 +118,7 @@ MinerU:
   language: ch                                           # 语言设置
   enable-table: true                                     # 是否启用表格识别
   enable-formula: true                                  # 是否启用公式识别
-  is-ocr: true                                          # 是否启用 OCR
+  is-ocr: false                                          # 是否启用 OCR
   polling-max-attempts: 100                             # 轮询最大次数
   polling-interval-ms: 5000                             # 轮询间隔 (毫秒)
   timeout-ms: 30000                                     # 请求超时 (毫秒)

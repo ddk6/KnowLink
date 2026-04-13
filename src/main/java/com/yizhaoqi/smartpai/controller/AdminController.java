@@ -10,6 +10,7 @@ import com.yizhaoqi.smartpai.model.User;
 import com.yizhaoqi.smartpai.repository.OrganizationTagRepository;
 import com.yizhaoqi.smartpai.repository.RechargePackageRepository;
 import com.yizhaoqi.smartpai.repository.UserRepository;
+import com.yizhaoqi.smartpai.service.ElasticsearchService;
 import com.yizhaoqi.smartpai.service.InviteCodeService;
 import com.yizhaoqi.smartpai.service.ModelProviderConfigService;
 import com.yizhaoqi.smartpai.service.RateLimitConfigService;
@@ -68,6 +69,9 @@ public class AdminController {
 
     @Autowired
     private ModelProviderConfigService modelProviderConfigService;
+
+    @Autowired
+    private ElasticsearchService elasticsearchService;
 
     @Autowired
     private RechargePackageRepository rechargePackageRepository;
@@ -1200,6 +1204,77 @@ public class AdminController {
             LogUtils.logBusinessError("ADMIN_DELETE_RECHARGE_PACKAGE", adminUsername, "删除充值套餐失败", e);
             return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
                     .body(Map.of("code", 500, "message", "删除充值套餐失败：" + e.getMessage()));
+        }
+    }
+
+    /**
+     * 清理 Elasticsearch 知识库所有文档
+     */
+    @DeleteMapping("/clearES")
+    public ResponseEntity<?> clearElasticsearch(@RequestHeader("Authorization") String token) {
+        String adminUsername = jwtUtils.extractUsernameFromToken(token.replace("Bearer ", ""));
+        try {
+            long deleted = elasticsearchService.deleteAllDocuments();
+            return ResponseEntity.ok(Map.of(
+                    "code", 200,
+                    "message", "ES 知识库已清空",
+                    "deleted", deleted
+            ));
+        } catch (Exception e) {
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+                    .body(Map.of("code", 500, "message", "清空 ES 失败：" + e.getMessage()));
+        }
+    }
+
+    /**
+     * 清理 Redis 所有数据
+     */
+    @DeleteMapping("/clearRedis")
+    public ResponseEntity<?> clearRedis(@RequestHeader("Authorization") String token) {
+        String adminUsername = jwtUtils.extractUsernameFromToken(token.replace("Bearer ", ""));
+        try {
+            Set<String> keys = redisTemplate.keys("*");
+            if (keys != null && !keys.isEmpty()) {
+                redisTemplate.delete(keys);
+            }
+            return ResponseEntity.ok(Map.of(
+                    "code", 200,
+                    "message", "Redis 已清空",
+                    "deleted", keys != null ? keys.size() : 0
+            ));
+        } catch (Exception e) {
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+                    .body(Map.of("code", 500, "message", "清空 Redis 失败：" + e.getMessage()));
+        }
+    }
+
+    /**
+     * 清理 ES 和 Redis
+     */
+    @DeleteMapping("/clearAll")
+    public ResponseEntity<?> clearAll(@RequestHeader("Authorization") String token) {
+        String adminUsername = jwtUtils.extractUsernameFromToken(token.replace("Bearer ", ""));
+        try {
+            // Clear ES
+            long esDeleted = elasticsearchService.deleteAllDocuments();
+
+            // Clear Redis
+            Set<String> redisKeys = redisTemplate.keys("*");
+            long redisDeleted = 0;
+            if (redisKeys != null && !redisKeys.isEmpty()) {
+                redisTemplate.delete(redisKeys);
+                redisDeleted = redisKeys.size();
+            }
+
+            return ResponseEntity.ok(Map.of(
+                    "code", 200,
+                    "message", "ES 和 Redis 已清空",
+                    "esDeleted", esDeleted,
+                    "redisDeleted", redisDeleted
+            ));
+        } catch (Exception e) {
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+                    .body(Map.of("code", 500, "message", "清空失败：" + e.getMessage()));
         }
     }
 }
