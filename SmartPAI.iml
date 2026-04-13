@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<module version="4">
+  <component name="AdditionalModuleElements">
+    <content url="file://$MODULE_DIR$" dumb="true">
+      <excludeFolder url="file://$MODULE_DIR$/anotherRagProject" />
+      <excludeFolder url="file://$MODULE_DIR$/anotherRagProject/FinInsRAG-V3/swxy(1)/swxy/backend/app/service/core/rag/res/deepdoc/.cache/huggingface/download" />
+      <excludeFolder url="file://$MODULE_DIR$/download" />
+      <excludeFolder url="file://$MODULE_DIR$/frontend/public/dist" />
+      <excludeFolder url="file://$MODULE_DIR$/frontend/public/languages" />
+      <excludeFolder url="file://$MODULE_DIR$/frontend/public/themes" />
+      <excludeFolder url="file://$MODULE_DIR$/logs" />
+    </content>
+  </component>
+</module>
