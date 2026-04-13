@@ -31,10 +31,12 @@
 
 ### 1.2 RAG Pipeline 现状
 
-| 环节 | 原有方案 | 现有方案 | 优化后 |
-|------|---------|---------|--------|
+| 环节 | 原有方案 | 现有方案 | 状态 |
+|------|---------|---------|------|
 | **文档解析** | Apache Tika (纯文本) | MinerU (Markdown+JSON) | ✅ 已优化 |
-| **文本分块** | 512字符固定切分 | 512字符 + 语义边界 | ✅ 已优化 |
+| **文本分块** | 512字符固定切分 | 512字符 + 语义边界 + 句子分割 | ⚠️ 部分优化 |
+| **文档结构识别** | 无 | MinerU 保留标题 | ⚠️ 待增强 |
+| **表格处理** | 无感知 | MinerU 返回 JSON | ⚠️ 待增强 |
 | **查询预处理** | 无 | 规则 Query Rewrite | ✅ 已实现 |
 | **向量召回** | KNN only | RRF 融合 (KNN+BM25) | ✅ 已优化 |
 | **重排序** | 无 | Cross-Encoder (qwen-rerank) | ✅ 已实现 |
@@ -217,7 +219,228 @@ query-rewrite:
 
 ---
 
-### 2.3 MinerU 文档解析增强 ✅
+### 2.4 文档切分策略分析 🔍
+
+#### 2.4.1 现状分析
+
+**PaiSmart 现有切分策略**：
+
+| 解析方式 | 切分依据 | 优点 | 缺点 |
+|---------|---------|------|------|
+| **Tika 解析** | 按段落 `\n\n+` | 实现简单 | 无语义边界感知 |
+| **Tika 长段落** | 按句子 `[。！？；.!?;]` | 保留句子完整性 | 可能切断列表 |
+| **Tika 超长句子** | HanLP 词法分析 | 中文友好 | 切分可能破坏语义 |
+| **MinerU 解析** | 按 Markdown 标题 `#` | 保留文档结构 | 标题下内容仍按字符切 |
+
+**现有流程**：
+```
+文本输入
+    ↓
+按 \n\n+ 分割段落
+    ↓
+当前 chunk + 段落 ≤ 512?
+    ├── 是 → 添加段落
+    └── 否 → 新建 chunk
+            ↓
+        段落 > 512?
+            ├── 是 → 按句子分割
+            └── 否 → 添加到当前 chunk
+                    ↓
+                句子 > 512?
+                    ├── 是 → HanLP 分词
+                    └── 否 → 添加到 chunk
+```
+
+#### 2.4.2 对比 anotherRagProject 的 DeepDoc 切分
+
+| 特性 | PaiSmart (现有) | anotherRagProject (DeepDoc) |
+|------|-----------------|---------------------------|
+| **文档结构识别** | ❌ 无 | ✅ YOLO Layout Detection |
+| **标题感知** | ⚠️ MinerU 保留标题 | ✅ Markdown 标题合并 |
+| **表格处理** | ❌ 无感知 | ✅ Table Structure Recognition |
+| **列表前导句** | ❌ 无 | ✅ `naive_merge` 合并机制 |
+| **递归细切** | ⚠️ 句子级 + 词级 | ✅ Token 级 + 细粒度合并 |
+| **OCR 集成** | ❌ 无 | ✅ CRNN OCR |
+| **切分单位** | 字符数 (512) | Token 数 (128) |
+
+**DeepDoc 切分流程**：
+```
+PDF 输入
+    ↓
+Layout Analysis (YOLO)
+    ↓
+┌────────────────────────────────────────┐
+│  文本区域    表格区域    图片区域        │
+│  (Text)     (Table)    (Image)         │
+└────────────────────────────────────────┘
+    ↓                    ↓
+Table Structure     OCR + Layout
+Recognition (TSR)    Recognition
+    ↓                    ↓
+HTML Table         图片 + 文字
+    ↓
+naive_merge (按 Token 合并)
+    ↓
+tokenize_chunks (添加位置信息)
+```
+
+#### 2.4.3 关键差异详解
+
+**1. 文档结构识别 (Document Structure Recognition)**
+
+PaiSmart: 无结构感知，按固定字符数切分
+```java
+// ParseService.java:500
+String[] paragraphs = text.split("\n\n+");
+```
+
+anotherRagProject: 识别布局结构
+```python
+# DeepDoc Layout Recognition
+self._layouts_rec(zoomin)  # YOLO-based
+self._table_transformer_job(zoomin)  # Table detection
+```
+
+**2. 递归细切 (Recursive Fine-Grained Chunking)**
+
+PaiSmart: 句子 → 词语 两级切分
+```java
+// 句子分割
+String[] sentences = paragraph.split("(?<=[。！？；])|(?<=[.!?;])\\s+");
+// 超长句子用 HanLP 分词
+List<Term> termList = StandardTokenizer.segment(sentence);
+```
+
+anotherRagProject: Token 级细切 + 合并
+```python
+# naive_merge: 按 delimiter 分割后，按 token 数合并
+# chunk_token_num=128 tokens
+def naive_merge(sections, chunk_token_num=128, delimiter="\n!?。；！？"):
+```
+
+**3. 表格表头保留 (Table Header Preservation)**
+
+PaiSmart: 无表格感知
+```java
+// Tika 输出纯文本，表格结构丢失
+// MinerU 返回 content_list_v2.json，但切分时未特殊处理
+```
+
+anotherRagProject: 表格单独处理
+```python
+# tokenize_table: 按行分批处理表格
+for i in range(0, len(rows), batch_size):
+    r = "; ".join(rows[i:i+batch_size])  # 保留行结构
+    d["content_with_weight"] = r
+```
+
+**4. 列表前导句合并 (List Leading Sentence Merging)**
+
+PaiSmart: 无此机制
+```java
+// 列表项被当作普通段落，可能在任意位置切断
+```
+
+anotherRagProject: naive_merge 自动合并
+```python
+# 关键机制：如果 chunk 超过限制，新 chunk 会包含前一个 chunk 的位置信息
+# 位置信息 (pos) 作为列表前导句被合并到下一个 chunk
+if t.find(pos) < 0:
+    t += pos  # 合并前导句
+```
+
+#### 2.4.4 优化建议
+
+**方案 A: 基于 MinerU 的结构化切分 (推荐)**
+
+现状: MinerU 已返回 `content_list_v2.json`，包含结构化信息
+```json
+{
+  "content_list_v2": [
+    {
+      "type": "table",
+      "content": "...",
+      "bbox": {...}
+    },
+    {
+      "type": "text",
+      "content": "...",
+      "heading": "相关工作"
+    }
+  ]
+}
+```
+
+优化方向:
+```java
+// MinerUService.java 优化
+public List<TextChunk> parseMarkdownWithStructure(String markdown, String contentJson) {
+    // 1. 解析 content_list_v2.json 获取结构信息
+    // 2. 按结构类型分别处理:
+    //    - table: 整表作为一个 chunk 或按行拆分
+    //    - text: 按标题分块，标题作为 prefix
+    // 3. 确保表格不被切断
+}
+```
+
+**方案 B: 增强 Tika 的表格感知**
+
+优化方向:
+```java
+// 在 ParseService 中添加表格检测
+private List<String> detectTables(String text) {
+    // 检测 markdown 表格格式 | col1 | col2 |
+    // 或 HTML 表格 <table>...</table>
+    // 表格整块输出，不切分
+}
+
+// 检测列表结构
+private boolean isListItem(String line) {
+    // 检测 - item, 1. item, (1) item 等格式
+    // 列表项与前导句合并
+}
+```
+
+**方案 C: 引入 DeepDoc 级别的切分 (高成本)**
+
+需要:
+- 部署 Python 微服务
+- ONNX 模型推理
+- 复杂的状态管理
+
+不推荐，除非有特殊需求（如简历解析）。
+
+#### 2.4.5 优先级评估
+
+| 优化项 | 难度 | 收益 | 推荐 |
+|--------|------|------|------|
+| **标题作为 prefix** | 低 | 中 (检索质量提升) | ✅ 推荐 |
+| **表格整块保留** | 中 | 高 (表格检索质量) | ✅ 推荐 |
+| **列表前导句合并** | 中 | 中 (列表语义完整) | ⚠️ 备选 |
+| **Token 级切分** | 中 | 中 (切分更均匀) | ⚠️ 备选 |
+| **DeepDoc 集成** | 高 | 高 (最优效果) | ❌ 暂不推荐 |
+
+#### 2.4.6 可用配置
+
+```yaml
+# 当前配置
+file:
+  parsing:
+    chunk-size: 512  # 字符数，不是 token 数
+
+# 建议优化配置
+file:
+  parsing:
+    chunk-size: 512
+    # chunk-token-num: 128  # 未来可切换为 token 数
+    preserve-tables: true    # 表格整块保留
+    merge-list-leading: true # 列表前导句合并
+    heading-as-prefix: true  # 标题作为 chunk 前缀
+```
+
+---
+
+### 2.5 MinerU 文档解析增强 ✅
 
 #### 2.3.1 问题背景
 
@@ -330,9 +553,9 @@ MinerU:
 
 ---
 
-## 三、待优化项
+## 四、待优化项
 
-### 3.1 对话记忆摘要 (中优先级)
+### 4.1 对话记忆摘要 (中优先级)
 
 **现状**：
 - Redis 存储，TTL 7天，限制 20 条（简单截断）
@@ -354,7 +577,7 @@ public class ConversationMemoryService {
 
 ---
 
-### 3.2 MCP 协议 + Agent 架构 (中优先级)
+### 4.2 MCP 协议 + Agent 架构 (中优先级)
 
 **现状**：
 - 仅有单轮问答能力
@@ -379,7 +602,7 @@ public class ReActAgent {
 
 ---
 
-### 3.3 RAG 评测框架 (低优先级)
+### 4.3 RAG 评测框架 (低优先级)
 
 **现状**：仅有用量统计，无效果评测
 
@@ -402,9 +625,9 @@ public class EvalDataset {
 
 ---
 
-## 四、文件变更清单
+## 五、文件变更清单
 
-### 4.1 已修改文件
+### 5.1 已修改文件
 
 | 文件 | 变更类型 | 说明 |
 |------|---------|------|
@@ -416,7 +639,7 @@ public class EvalDataset {
 | `application.yml` | 修改 | MinerU/Rerank/QueryRewrite 配置 |
 | `frontend/src/enum/index.ts` | 修改 | ParseStatus 枚举 |
 
-### 4.2 新增文件
+### 5.2 新增文件
 
 | 文件 | 说明 |
 |------|------|
@@ -431,7 +654,7 @@ public class EvalDataset {
 
 ---
 
-## 五、技术债务与风险
+## 六、技术债务与风险
 
 | 项目 | 风险 | 缓解措施 |
 |------|------|---------|
@@ -443,9 +666,9 @@ public class EvalDataset {
 
 ---
 
-## 六、配置参考
+## 七、配置参考
 
-### 6.1 环境变量
+### 7.1 环境变量
 
 ```bash
 # 必须配置
@@ -456,7 +679,7 @@ export EMBEDDING_API_KEY="your-aliyun-key"  # 通义千问 API Key
 export ELASTIC_PASSWORD="PaiSmart2025"
 ```
 
-### 6.2 关键端口
+### 7.2 关键端口
 
 | 服务 | 端口 | 说明 |
 |------|------|------|
