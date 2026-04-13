@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//d/Project/**)",
+      "Bash(export MINERU_TOKEN=\"eyJ0eXBlIjoiSldUIiwiYWxnIjoiSFM1MTIifQ.eyJqdGkiOiIxNTgwMDE3MSIsInJvbCI6IlJPTEVfUkVHSVNURVIiLCJpc3MiOiJPcGVuWExhYiIsImlhdCI6MTc3NTk3MTgxMiwiY2xpZW50SWQiOiJsa3pkeDU3bnZ5MjJqa3BxOXgydyIsInBob25lIjoiMTU1NjMyOTg1NDYiLCJvcGVuSWQiOm51bGwsInV1aWQiOiIwODU0NTA2ZC1hYThkLTRjMzYtYTBlMC05OTkyOWE0NmRmN2QiLCJlbWFpbCI6IiIsImV4cCI6MTc4Mzc0NzgxMn0.-ndyQLXlWPhh3fQS6Ddg_jkOcWwnvYwLlgBdSfII0qkmgln-yWix_0tNHywR7lWngPsryk2o2Lr3uhK4qLEMKw\")",
+      "Bash(mvn compile:*)",
+      "Bash(where mvn:*)",
+      "Bash(ls /d/Project/PaiSmart-main/*.cmd)",
+      "Bash(javac --version)",
+      "Bash(javac MinerUApiDemo.java)",
+      "Bash(java -version)",
+      "Bash(rm -f MinerUApiDemo.java MinerUApiDemo.class 'MinerUApiDemo$BatchApplyResult.class')",
+      "Bash(ls -la *.java)",
+      "Bash(javac -encoding UTF-8 -cp '.;__TRACKED_VAR__/.m2/repository/com/fasterxml/jackson/core/jackson-databind/2.15.3/jackson-databind-2.15.3.jar;__TRACKED_VAR__/.m2/repository/com/fasterxml/jackson/core/jackson-core/2.15.3/jackson-core-2.15.3.jar;__TRACKED_VAR__/.m2/repository/com/fasterxml/jackson/core/jackson-annotations/2.15.3/jackson-annotations-2.15.3.jar' src/test/java/com/yizhaoqi/smartpai/MinerUApiDemo.java)"
+    ]
+  }
+}

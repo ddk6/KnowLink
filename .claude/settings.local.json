@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:help.aliyun.com)",
+      "WebSearch",
+      "WebFetch(domain:github.com)",
+      "Read(//d/Project//**)",
+      "Bash(dir /d /a:d)"
+    ]
+  }
+}
