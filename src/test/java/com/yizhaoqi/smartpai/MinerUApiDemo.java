@@ -2,6 +2,7 @@ package com.yizhaoqi.smartpai;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.yizhaoqi.smartpai.service.MinerUService;
 import org.yaml.snakeyaml.Yaml;
 
 import java.io.FileInputStream;
@@ -91,18 +92,18 @@ public class MinerUApiDemo {
         try {
             // Step 1: 申请上传链接
             System.out.println("\n[Step 1] 申请上传链接...");
-            BatchApplyResult batchResult = demo.applyUploadUrl(pdfFile);
-            System.out.println("batch_id: " + batchResult.batchId());
-            System.out.println("upload_url: " + batchResult.uploadUrl());
+            MinerUService.BatchApplyResult batchResult = demo.applyUploadUrl(pdfFile);
+            System.out.println("batch_id: " + batchResult.getBatchId());
+            System.out.println("upload_url: " + batchResult.getUploadUrl());
 
             // Step 2: 上传文件
             System.out.println("\n[Step 2] 上传文件...");
-            demo.uploadFile(batchResult.uploadUrl(), pdfFile);
+            demo.uploadFile(batchResult.getUploadUrl(), pdfFile);
             System.out.println("文件上传成功!");
 
             // Step 3: 等待解析完成
             System.out.println("\n[Step 3] 等待解析完成 (轮询中...)");
-            String zipUrl = demo.waitForBatchDone(batchResult.batchId());
+            String zipUrl = demo.waitForBatchDone(batchResult.getBatchId());
 
             if (zipUrl != null) {
                 System.out.println("\n解析成功!");
@@ -372,6 +373,4 @@ public class MinerUApiDemo {
 
         return root.path("data").path("task_id").asText();
     }
-
-    public record BatchApplyResult(String batchId, String uploadUrl) {}
 }

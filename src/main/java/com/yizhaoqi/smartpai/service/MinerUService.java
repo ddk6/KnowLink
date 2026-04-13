@@ -56,18 +56,18 @@ public class MinerUService {
 
         // 1. 申请上传链接
         BatchApplyResult applyResult = applyUploadUrl(fileName, dataId);
-        log.info("[MinerU] 获得上传链接, batchId: {}", applyResult.batchId);
+        log.info("[MinerU] 获得上传链接, batchId: {}", applyResult.getBatchId());
 
         // 2. 上传文件到 MinerU OSS
-        uploadFile(applyResult.uploadUrl, file);
+        uploadFile(applyResult.getUploadUrl(), file);
         log.info("[MinerU] 文件上传成功");
 
         // 3. 轮询等待解析完成
-        String zipUrl = waitForBatchDone(applyResult.batchId());
+        String zipUrl = waitForBatchDone(applyResult.getBatchId());
         log.info("[MinerU] 解析完成, ZIP URL: {}", zipUrl);
 
         // 4. 下载并解析 ZIP
-        return downloadAndParseZip(zipUrl, applyResult.batchId());
+        return downloadAndParseZip(zipUrl, applyResult.getBatchId());
     }
 
     /**

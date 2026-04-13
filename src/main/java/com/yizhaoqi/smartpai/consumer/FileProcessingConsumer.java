@@ -4,7 +4,7 @@ import com.yizhaoqi.smartpai.config.KafkaConfig;
 import com.yizhaoqi.smartpai.config.MinerUProperties;
 import com.yizhaoqi.smartpai.model.FileProcessingTask;
 import com.yizhaoqi.smartpai.model.FileUpload;
-import com.yizhaoqi.smartpai.model.MinerUParseResultEntity;
+import com.yizhaoqi.smartpai.model.MinerUParseResult;
 import com.yizhaoqi.smartpai.repository.FileUploadRepository;
 import com.yizhaoqi.smartpai.repository.MinerUParseResultRepository;
 import com.yizhaoqi.smartpai.service.MinerUService;
@@ -191,7 +191,7 @@ public class FileProcessingConsumer {
      * 保存 MinerU 解析结果到数据库
      */
     private void saveMinerUResult(String fileMd5, MinerUService.MinerUParseResult parseResult) {
-        MinerUParseResultEntity entity = new MinerUParseResultEntity();
+        MinerUParseResult entity = new MinerUParseResult();
         entity.setFileMd5(fileMd5);
         entity.setFullMd(parseResult.getFullMd());
         entity.setContentJson(parseResult.getContentJson());

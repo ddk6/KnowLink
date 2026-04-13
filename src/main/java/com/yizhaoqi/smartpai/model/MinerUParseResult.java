@@ -15,7 +15,7 @@ import java.time.LocalDateTime;
 @Table(name = "mineru_parse_result", indexes = {
         @Index(name = "idx_file_md5", columnList = "file_md5")
 })
-public class MinerUParseResultEntity {
+public class MinerUParseResult {
 
     /** 自增主键 */
     @Id
