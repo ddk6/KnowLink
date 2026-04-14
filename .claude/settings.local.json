@@ -5,7 +5,31 @@
       "WebSearch",
       "WebFetch(domain:github.com)",
       "Read(//d/Project//**)",
-      "Bash(dir /d /a:d)"
+      "Bash(dir /d /a:d)",
+      "Bash(docker exec:*)",
+      "Bash(netstat -ano)",
+      "Bash(mvn clean:*)",
+      "Bash(powershell -Command \"Test-NetConnection -ComputerName localhost -Port 3306 | Select-Object TcpTestSucceeded\")",
+      "Bash(docker compose:*)",
+      "Bash(curl -s -X POST http://localhost:8081/api/v1/auth/login -H 'Content-Type: application/json' -d '{\"username\":\"admin\",\"password\":\"admin123admin123\"}')",
+      "Bash(powershell -Command \"Test-NetConnection -ComputerName localhost -Port 8081 | Select-Object TcpTestSucceeded\")",
+      "Bash(curl -v -X POST http://localhost:8081/api/v1/auth/login -H 'Content-Type: application/json' -d '{\"username\":\"admin\",\"password\":\"admin123admin123\"}')",
+      "Bash(curl -s -X POST http://localhost:8081/api/v1/auth/register -H 'Content-Type: application/json' -d '{\"username\":\"admin\",\"password\":\"admin123admin123\",\"inviteCode\":\"\"}')",
+      "Bash(curl -v http://localhost:8081/api/v1/auth/register -X POST -H 'Content-Type: application/json' -d '{\"username\":\"admin\",\"password\":\"admin123admin123\",\"inviteCode\":\"\"}')",
+      "Bash(curl -s -X POST http://localhost:8081/api/v1/users/login -H 'Content-Type: application/json' -d '{\"username\":\"admin\",\"password\":\"admin123admin123\"}')",
+      "Bash(curl -s -X DELETE http://localhost:8081/api/v1/admin/clearAll -H 'Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.eyJwcmltYXJ5T3JnIjoiZGVmYXVsdCIsIm9yZ1RhZ3MiOiJkZWZhdWx0LGFkbWluIiwicm9sZSI6IkFETUlOIiwidG9rZW5JZCI6ImQ2NzkzZTBmNjUyMzQ2NjA5MTY3MmUxNjY5MWM4NjFkIiwidXNlcklkIjoiMSIsInN1YiI6ImFkbWluIiwiZXhwIjoxNzc2MTMzMDMzfQ.on_UOrcyYNQCQudl1vk7p17n7Oay_YV0oUqo-C_qJ_A')",
+      "Bash(curl -s -X DELETE http://localhost:8081/api/v1/admin/clearAll -H 'Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.eyJwcmltYXJ5T3JnIjoiZGVmYXVsdCIsIm9yZ1RhZ3MiOiJkZWZhdWx0LGFkbWluIiwicm9sZSI6IkFETUlOIiwidG9rZW5JZCI6IjVhNThmOWYyZmQ3MDQ1MTQ4MWYzYzNmNTVjMzhlZWRmIiwidXNlcklkIjoiMSIsInN1YiI6ImFkbWluIiwiZXhwIjoxNzc2MTMzMTA5fQ.DSLSblzLHNWV92QRZkWE4qNNk5auOuvFlJxi0zIYm_E')",
+      "Bash(curl -s -X DELETE http://localhost:8081/api/v1/admin/clearAll -H 'Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.eyJwcmltYXJ5T3JnIjoiZGVmYXVsdCIsIm9yZ1RhZ3MiOiJkZWZhdWx0LGFkbWluIiwicm9sZSI6IkFETUlOIiwidG9rZW5JZCI6IjgwNTBiOTE0YWRjZjQ1ZWM5NjgxMGYwNmFlNTYxMDBmIiwidXNlcklkIjoiMSIsInN1YiI6ImFkbWluIiwiZXhwIjoxNzc2MTMzMzYwfQ.ANfLXnabEs5hve9XwMY6r0Vxc4qUP6FUsCXtfSHwvYo')",
+      "Bash(head -n 2396 d:/Project/PaiSmart-main/src/main/java/com/yizhaoqi/smartpai/service/MinerUService.java)",
+      "Bash(mv d:/tmp/MinerUService_temp.java d:/Project/PaiSmart-main/src/main/java/com/yizhaoqi/smartpai/service/MinerUService.java)",
+      "Bash(head -n 2331 d:/Project/PaiSmart-main/src/main/java/com/yizhaoqi/smartpai/service/MinerUService.java)",
+      "Bash(head -n 1585 d:/Project/PaiSmart-main/src/main/java/com/yizhaoqi/smartpai/service/MinerUService.java)",
+      "Bash(echo '}')",
+      "Bash(cmd.exe /c \"mvn compile -pl . -q 2>&1 | head -30\")",
+      "Bash(powershell.exe -Command \"mvn compile -pl . -q 2>&1 | Select-Object -First 30\")"
+    ],
+    "additionalDirectories": [
+      "d:\\Project\\PaiSmart-main\\target\\classes"
     ]
   }
 }

@@ -36,7 +36,7 @@
 | **文档解析** | Apache Tika (纯文本) | MinerU (Markdown+JSON) | ✅ 已优化 |
 | **文本分块** | 512字符固定切分 | V3 语义感知切分（标题/表格/列表结构化） | ✅ 已实现 |
 | **文档结构识别** | 无 | MinerU content_list_v2.json 结构化识别 | ✅ 已实现 |
-| **表格处理** | 无感知 | V3 表格切分（小表格整体，大表格按行+表头） | ✅ 已实现 |
+| **表格处理** | 无感知 | V3 表格切分（小表格整体，大表格按行+表头，**max_token=1024**） | ✅ 已实现 |
 | **列表前导句** | 无 | V3 前导句+列表项合并，过长拆分保留前导句 | ✅ 已实现 |
 | **查询预处理** | 无 | 规则 Query Rewrite | ✅ 已实现 |
 | **向量召回** | KNN only | RRF 融合 (KNN+BM25) | ✅ 已优化 |
@@ -402,13 +402,28 @@ MinerU 返回的 `content_list_v2.json` 包含完整的结构化信息：
    ↓
 输出最终 chunks
 ```
+```
+splitSectionText(text, maxTokens=1024)
+    │
+    ├─ text ≤ 1024？→ 直接1个chunk，return
+    │
+    ├─ text > 1024，有子标题（split by \n(?=#)）
+    │   ├─ 子部分A → 递归调用 splitSectionText(子部分A, 1024)
+    │   │             ├─ ≤1024？→ 直接1个chunk
+    │   │             └─ >1024？→ 子标题有 → 再递归（最多1层）
+    │   │                            └─ 子标题无 → sentenceAwareSplit（不递归）
+    │   └─ 子部分B → 同上
+    │
+    └─ text > 1024，无子标题 → sentenceAwareSplit（直接切，不递归）
+
+```
 
 #### 4.2.3 核心切分规则
 
 | 功能 | 实现方式 | chunkSize 规则 |
 |------|---------|---------------|
 | 标题层级识别 | JSON 中 `type: "title"` + `level` 字段 | section 内合并，最大 **1024 token** |
-| 表格处理 | JSON 中 `type: "table"`, 提取 `html` + `table_caption` | **max_size = 300 token**，小表格整体为1个chunk；大表格按行切分，每行 chunk **必须包含前2行表头** |
+| 表格处理 | JSON 中 `type: "table"`, 提取 `html` + `table_caption` | **max_size = 1024 token**，小表格整体为1个chunk；大表格按行切分，每行 chunk **必须包含前2行表头** |
 | 列表处理 | JSON 中 `type: "list"`, 提取前导句 + items | 前导句+列表项合并为1个chunk；**如果过长可拆分，但每个 chunk 必须保留前导句** |
 | 关键条款 | 标题含"保险责任", "责任免除", "费率", "赔付"关键词 | max_size 可扩大到 **1536 token** |
 | 智能 overlap | 每 chunk 末尾保留 100 token，与下一 chunk 开头重叠 | 扩展到最近句子边界（。！？；）避免截断半句 |
@@ -431,9 +446,9 @@ List<String> rows = parseHtmlTable(html);
 List<String> headerRows = rows.subList(0, 2);
 String headerText = String.join("\n", headerRows);
 
-// 3. 数据行按 300 token 限制切分，每 chunk 必须包含表头
+// 3. 数据行按 1024 token 限制切分，每 chunk 必须包含表头
 for (int i = 2; i < rows.size(); i++) {
-    if (currentTokens + estimateTokens(rows.get(i)) > 300 && !currentRows.isEmpty()) {
+    if (currentTokens + estimateTokens(rows.get(i)) > 1024 && !currentRows.isEmpty()) {
         chunks.add(headerText + "\n" + String.join("\n", currentRows));
         currentRows.clear();
         currentTokens = estimateTokens(headerText);
@@ -453,97 +468,13 @@ for (int i = 2; i < rows.size(); i++) {
 //    chunk2: [前导句] + (3) + (4)
 ```
 
-### 4.3 Bug 修复记录
-
-#### 4.3.1 Critical: 表格类型被跳过
-
-**问题现象**：表格解析日志从未出现，所有表格块被跳过
-
-**根本原因**：
-```java
-// extractTextFromV2Block 对 table 类型返回空字符串
-String text = extractTextFromV2Block(type, contentObj);  // table 返回 ""
-
-// 外层判断 text.isBlank() 时跳过，导致 table 类型永远无法进入 switch
-if (text.isBlank() && !"table".equals(type)) {
-    continue;  // table 被错误跳过
-}
-```
-
-**修复方案**：
-```java
-String text = extractTextFromV2Block(type, contentObj);
-// 注意：table 类型返回空字符串，但需要进入 switch 处理表格，不能跳过
-if (text.isBlank() && !"table".equals(type)) {
-    continue;
-}
-```
-
-#### 4.3.2 页码计算错误
-
-**问题**：页码显示 21 而不是 1-4
-
-**原因**：使用 `block.path("page_idx")` 获取的是块内部索引，而非页码
-
-**修复**：
-```java
-int pageNum = pageIdx + 1;  // 使用数组索引 +1 作为页码
-```
-
-#### 4.3.3 表格 HTML 字段错误
-
-**问题**：`contentObj.path("table_body")` 返回空
-
-**原因**：JSON 中表格 HTML 字段是 `html`，不是 `table_body`
-
-**修复**：
-```java
-String tableBody = contentObj.path("html").asText("");
-```
-
-#### 4.3.4 表格 Caption 格式错误
-
-**问题**：caption 提取失败
-
-**原因**：`table_caption` 是数组，不是字符串
-
-**修复**：
-```java
-JsonNode captionNode = block.path("table_caption");
-if (captionNode.isArray() && captionNode.size() > 0) {
-    String captionPreview = captionNode.get(0).path("content").asText();
-}
-```
-
-#### 4.3.5 列表 Lead 提取位置错误
-
-**问题**：前导句始终为空
-
-**原因**：`lead` 在 block 层级，不在 contentObj 内
-
-**修复**：
-```java
-// 修改方法签名接收完整 block
-parseListChunkV2(block, contentObj, ...)
-// 从 block.path("lead") 提取
-```
-
-#### 4.3.6 表头换行符缺失
-
-**问题**：表头两行连接在一起，语义不清
-
-**修复**：
-```java
-String header = rows[0] + "\n" + rows[1];  // 添加换行符
-```
-
-### 4.4 实施检查清单
+### 4.3 实施检查清单
 
 | 阶段 | 任务 | 状态 |
 |------|------|------|
 | 阶段一 | 重写 `MinerUService.parseMarkdownWithStructure()` 使用 content_list_v2.json | ✅ 完成 |
 | 阶段一 | 标题层级识别 + section path 构建 | ✅ 完成 |
-| 阶段一 | 表格检测 + 按行切分 + 前2行表头复制（max_size=300 token） | ✅ 完成 |
+| 阶段一 | 表格检测 + 按行切分 + 前2行表头复制（max_size=1024 token） | ✅ 完成 |
 | 阶段一 | 列表前导句绑定（前导句+items合并，过长拆分但保留前导句） | ✅ 完成 |
 | 阶段一 | 关键条款识别（关键词匹配，max_size=1536） | ✅ 完成 |
 | 阶段一 | 智能 overlap（100 token + 扩展到句子边界） | ✅ 完成 |
@@ -556,54 +487,47 @@ String header = rows[0] + "\n" + rows[1];  // 添加换行符
 
 ## 五、待优化项
 
-### 5.1 对话记忆摘要 (中优先级)
+### 5.1 两级对话记忆架构 (中优先级)
 
 **现状**：
 - Redis 存储，TTL 7天，限制 20 条（简单截断）
 - 长对话会溢出上下文窗口
 
-**优化方案**：
-```java
-@Service
-public class ConversationMemoryService {
-    // 对话超过 N 轮时，调用 LLM 摘要历史
-    // 保留关键实体、问题模式、决策结论
-    // 替换超长历史为: 摘要 + 关键点列表
-}
+**优化方案：两级记忆架构**
 ```
+用户问问题
+    │
+    ▼
+┌─────────────────────────────────────────────────────────────┐
+│ 短期记忆 (Redis)                                            │
+│ - 存储最近 5 轮对话（原始 JSON）                             │
+│ - TTL 7 天，超出 5 轮时触发摘要逻辑                         │
+│ - 查询时直接拼入上下文                                       │
+└─────────────────────────────────────────────────────────────┘
+    │
+    ▼ 触发条件: history.size() % 5 == 0
+┌─────────────────────────────────────────────────────────────┐
+│ 长期记忆 (ES conversation_summaries index)                  │
+│ - 早期对话摘要后存入 ES                                     │
+│ - 向量+关键词混合检索                                       │
+│ - 按 user_id 过滤                                           │
+│ - 查询时由 query 动态唤醒                                   │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**摘要触发时机**：
+- 当 `history.size() % 5 == 0` 时触发摘要
+- 摘要内容：关键实体、问题模式、决策结论
+- 摘要后删除 Redis 中的原始记录
 
 **预期效果**：
-- 上下文窗口利用率提升 50%
+- 上下文窗口利用率提升 50%+
 - 长时间对话质量稳定
+- 近期对话保留原文精确性，早期对话保留语义可检索性
 
 ---
 
-### 5.2 MCP 协议 + Agent 架构 (中优先级)
-
-**现状**：
-- 仅有单轮问答能力
-- 无法调用外部工具（查天气、读文件等）
-
-**优化方案**：
-```java
-// 1. 定义工具接口
-@Tool(name = "file_reader", description = "读取本地文件内容")
-String readFile(@ToolParam("path") String path);
-
-@Tool(name = "search_web", description = "搜索网页内容")
-String searchWeb(@ToolParam("query") String query);
-
-// 2. 实现 ReAct Agent
-@Service
-public class ReActAgent {
-    // Loop: Thought → Action → Observation → Answer
-    // 使用 DeepSeek 思维链能力
-}
-```
-
----
-
-### 5.3 RAG 评测框架 (低优先级)
+### 5.2 RAG 评测框架 (低优先级)
 
 **现状**：仅有用量统计，无效果评测
 
