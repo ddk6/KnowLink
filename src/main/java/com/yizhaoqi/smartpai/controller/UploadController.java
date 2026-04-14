@@ -86,6 +86,10 @@ public class UploadController {
         LogUtils.PerformanceMonitor monitor = LogUtils.startPerformanceMonitor("UPLOAD_CHUNK");
         try {
             // 文件类型验证（仅在第一个分片时进行验证）
+            //这是验证啥？
+            //验证文件类型是否支持上传
+            //如果文件类型不支持上传，会返回错误信息
+            //每个文件只能上传一次，所以只在第一个分片时进行验证
             if (chunkIndex == 0) {
                 FileTypeValidationService.FileTypeValidationResult validationResult = 
                     fileTypeValidationService.validateFileType(fileName);
@@ -114,6 +118,8 @@ public class UploadController {
                     fileMd5, chunkIndex, fileName, fileType, contentType, file.getSize(), totalSize, orgTag, isPublic);
         
             // 如果未指定组织标签，则获取用户的主组织标签
+            //这是为了确保文件上传到正确的组织下
+            //如果用户没有指定组织标签，会使用用户的主组织标签
             if (orgTag == null || orgTag.isEmpty()) {
                 try {
                     LogUtils.logBusiness("UPLOAD_CHUNK", userId, "组织标签未指定，尝试获取用户主组织标签: fileName=%s", fileName);
@@ -129,7 +135,10 @@ public class UploadController {
                     return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(errorResponse);
                 }
             }
-
+            // 验证文件大小是否超过组织限制
+            //这是为了确保文件大小不超过组织的上传大小限制
+            //如果文件大小超过组织的上传大小限制，会返回错误信息
+            //这也算是一种安全措施，防止用户上传过大的文件，导致服务器资源被占用
             if (!userService.isAdminUser(userId)) {
                 OrganizationTag uploadOrg = userService.getOrganizationTag(orgTag);
                 Long uploadMaxSizeBytes = uploadOrg.getUploadMaxSizeBytes();
@@ -151,14 +160,22 @@ public class UploadController {
                     return ResponseEntity.status(HttpStatus.PAYLOAD_TOO_LARGE).body(errorResponse);
                 }
             }
+            //上面的这三个检验都是为了确保文件上传的安全性和正确性
+            //为了确保文件上传的安全性和正确性，需要进行哪些检验？
+            //答案是：文件类型验证、组织标签验证、文件大小验证
+
         
             LogUtils.logFileOperation(userId, "UPLOAD_CHUNK", fileName, fileMd5, "PROCESSING");
-        
+
+            // 上传分片
+            // 这里会调用uploadService的uploadChunk方法，来上传分片
+            // 上传分片时，会将分片的MD5值、分片的存储路径等信息保存到数据库
             uploadService.uploadChunk(fileMd5, chunkIndex, totalSize, fileName, file, orgTag, isPublic, userId);
-            
+
+            //获取已上传的分片索引列表  用来计算上传进度
             List<Integer> uploadedChunks = uploadService.getUploadedChunks(fileMd5, userId);
             int actualTotalChunks = uploadService.getTotalChunks(fileMd5, userId);
-            double progress = calculateProgress(uploadedChunks, actualTotalChunks);
+            double progress = calculateProgress(uploadedChunks, actualTotalChunks);//计算上传进度
             
             LogUtils.logBusiness("UPLOAD_CHUNK", userId, "分片上传成功: fileMd5=%s, fileName=%s, fileType=%s, chunkIndex=%d, 进度=%.2f%%", 
                     fileMd5, fileName, fileType, chunkIndex, progress);
@@ -259,6 +276,14 @@ public class UploadController {
      * @param userId 当前用户ID
      * @return 返回包含合并后文件访问URL的响应
      */
+
+    //合并之前的准备工作
+    //检查文件是否存在  如何检查的？
+    //答案是根据文件MD5值从数据库中查询文件记录
+    //如果文件不存在，返回错误响应
+    //如果文件存在，继续合并分片
+    //合并分片时，需要根据分片索引来合并分片内容
+
     @PostMapping("/merge")
     public ResponseEntity<Map<String, Object>> mergeFile(
             @RequestBody MergeRequest request,
@@ -271,6 +296,7 @@ public class UploadController {
                     request.fileMd5(), request.fileName(), fileType);
             
             // 检查文件完整性和权限
+            //这里检查的是
             LogUtils.logBusiness("MERGE_FILE", userId, "检查文件记录和权限: fileMd5=%s, fileName=%s", request.fileMd5(), request.fileName());
             FileUpload fileUpload = fileUploadRepository.findFirstByFileMd5AndUserIdOrderByCreatedAtDesc(request.fileMd5(), userId)
                     .orElseThrow(() -> {
@@ -289,7 +315,8 @@ public class UploadController {
                 errorResponse.put("message", "没有权限操作此文件");
                 return ResponseEntity.status(HttpStatus.FORBIDDEN).body(errorResponse);
             }
-
+            //检查文件是否已完成合并
+            //如果文件已完成合并，直接返回合并后的文件访问URL
             if (fileUpload.getStatus() == FileUpload.STATUS_COMPLETED) {
                 LogUtils.logBusiness("MERGE_FILE", userId, "文件已完成合并，按幂等成功返回: fileMd5=%s, fileName=%s", request.fileMd5(), request.fileName());
                 monitor.end("文件已完成合并");
@@ -437,6 +464,9 @@ public class UploadController {
         }
     }
 
+    //这是构建文件已完成合并的响应
+    //传入的是文件MD5值
+    //返回文件已完成合并的响应
     private ResponseEntity<Map<String, Object>> buildAlreadyMergedResponse(String fileMd5) throws Exception {
         Map<String, Object> data = new HashMap<>();
         data.put("object_url", uploadService.generateMergedObjectUrl(fileMd5));
@@ -455,6 +485,14 @@ public class UploadController {
      * @param totalChunks 总分片数量
      * @return 返回上传进度的百分比
      */
+    //传入的是已上传的分片索引列表  总分片数量
+    //返回上传进度的百分比
+
+    //这个计算上传进度是在上传分片时调用的 这个上传进度有什么用？
+    //上传进度可以用于：
+    //用于展示给用户，了解文件上传的进度
+    //用于记录上传日志，方便调试和分析上传性能
+    //用于触发上传完成后的操作，如合并文件、生成嵌入向量等
     private double calculateProgress(List<Integer> uploadedChunks, int totalChunks) {
         if (totalChunks == 0) {
             LogUtils.logBusiness("CALCULATE_PROGRESS", "system", "计算上传进度时总分片数为0");
@@ -463,6 +501,12 @@ public class UploadController {
         return (double) uploadedChunks.size() / totalChunks * 100;
     }
 
+    //这是格式化文件大小
+    //传入的是文件大小（字节）
+    //返回格式化后的文件大小（MB或GB）
+    //如果文件大小大于等于1024MB，返回GB格式
+    //如果文件大小大于等于1MB，返回MB格式
+    //否则返回KB格式
     private String formatSize(long sizeInBytes) {
         double sizeInMb = sizeInBytes / (1024d * 1024d);
         if (sizeInMb >= 1024d) {

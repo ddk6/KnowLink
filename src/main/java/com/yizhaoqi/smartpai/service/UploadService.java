@@ -77,9 +77,13 @@ public class UploadService {
                    fileMd5, chunkIndex, totalSize, fileName, fileType, contentType, file.getSize(), orgTag, isPublic, userId);
         
         try {
+            //这是检验文件上传记录是否存在
             FileUpload fileUpload = getOrCreateFileUpload(fileMd5, totalSize, fileName, orgTag, isPublic, userId, fileType);
-            logger.debug("检查文件记录是否存在 => fileMd5: {}, fileName: {}, fileType: {}, status: {}", fileMd5, fileName, fileType, fileUpload.getStatus());
-
+            logger.debug("检查文件记录是否存在 => fileMd5: {}, fileName: {}, fileType: {}, status: {}", fileMd5, fileName, fileType, fileUpload.getStatus());//这是检查文件上传记录是否存在
+            //如果文件上传记录不存在，需要创建新的文件上传记录
+            //如果文件上传记录存在，需要检查文件上传记录的状态
+            //如果文件上传记录状态是MERGING，说明文件正在合并中，不允许继续上传分片
+            //如果文件上传记录状态是COMPLETED，说明文件已完成合并，不允许继续上传分片
             if (fileUpload.getStatus() == FileUpload.STATUS_MERGING) {
                 throw new CustomException("文件正在合并中，请稍后重试", HttpStatus.CONFLICT);
             }
@@ -88,12 +92,29 @@ public class UploadService {
             }
 
             // 检查分片是否已经上传
+            //这是干啥的？
+            //答案是：为了确保分片上传的安全性和正确性，需要检查分片是否已经上传
+            //检查的是啥？
+            //答案是：分片索引
             boolean chunkUploaded = isChunkUploaded(fileMd5, chunkIndex, userId);
             logger.debug("检查分片是否已上传 => fileMd5: {}, fileName: {}, chunkIndex: {}, isUploaded: {}", 
                       fileMd5, fileName, chunkIndex, chunkUploaded);
                       
             // 检查数据库中是否存在分片信息
+            //这是干啥的？
+            //为了确保分片上传的安全性和正确性，需要检查分片是否已经上传
+            //如果分片已经上传，但是数据库中不存在记录，需要创建记录
+            //如果分片没有上传，但是数据库中存在记录，需要更新记录
+            //MySQL数据库中存的是分片的索引、用户ID、文件MD5、总分片数
+            //分片信息存储到MySQL数据库中是发生在分片上传完成后
+            //这个分片信息和file_upload表有啥关系？
+            //答案是：分片信息是文件上传记录的子记录，每个分片都有一个对应的分片信息
+
+            //文件上传记录是第一次上传分片的时候创建的
+
+            //那redis中存的是分片的索引、用户ID、文件MD5、上传状态bitmap
             boolean chunkInfoExists = false;
+            //这是检验数据库中是否存在分片信息
             try {
                 chunkInfoExists = chunkInfoRepository.existsByFileMd5AndChunkIndex(fileMd5, chunkIndex);
                 logger.debug("检查数据库中分片信息 => fileMd5: {}, fileName: {}, chunkIndex: {}, exists: {}", 
@@ -107,7 +128,10 @@ public class UploadService {
             
             String chunkMd5 = null;
             String storagePath = null;
-            
+
+            //redis+mysql双重检查
+            //如果分片已经上传，但是数据库中不存在记录，需要创建分片信息
+            //如果分片没有上传，但是数据库中存在记录，需要更新分片信息
             if (chunkUploaded) {
                 logger.warn("分片已在Redis中标记为已上传 => fileMd5: {}, fileName: {}, fileType: {}, chunkIndex: {}", fileMd5, fileName, fileType, chunkIndex);
                 
@@ -138,6 +162,7 @@ public class UploadService {
                         // 如果MinIO中不存在，将chunkUploaded设为false以触发上传流程
                         chunkUploaded = false;
                     }
+                    //
                 } else {
                     logger.info("分片已上传且数据库有记录，跳过处理 => fileMd5: {}, fileName: {}, chunkIndex: {}", fileMd5, fileName, chunkIndex);
                     return; // 完全跳过处理
@@ -145,6 +170,7 @@ public class UploadService {
             }
             
             // 如果分片未上传或需要重新上传
+            //
             if (!chunkUploaded) {
                 // 计算分片的 MD5 值
                 logger.debug("计算分片MD5 => fileMd5: {}, fileName: {}, chunkIndex: {}", fileMd5, fileName, chunkIndex);
@@ -326,6 +352,22 @@ public class UploadService {
      * @param userId 用户ID
      * @return 分片是否已上传
      */
+    //这里传入userId是为了区分不同用户的上传状态
+    //通过userId+fileMd5作为redis键，来存储每个用户的上传状态
+    //一个bitmap对应的是一个文件的上传状态 不是用户的？
+
+    //如果是一个用户上传了两个文件  那么它有几个bitmap？
+    //答案是两个
+    //每个用户的上传状态是一个位数组，每个位对应一个分片
+    //位数组的长度等于文件的分片总数
+    //每个位的值表示该分片是否已上传
+
+    //怎么检验的？
+    //答案是通过redis的getBit命令来检验
+    //getBit命令的语法是GETBIT key offset
+    //key是redis键，offset是位偏移量
+    //如果offset对应的位是1，说明该分片已上传
+    //如果offset对应的位是0，说明该分片未上传
     public boolean isChunkUploaded(String fileMd5, int chunkIndex, String userId) {
         logger.debug("检查分片是否已上传 => fileMd5: {}, chunkIndex: {}, userId: {}", fileMd5, chunkIndex, userId);
         try {
@@ -352,6 +394,14 @@ public class UploadService {
      * @param chunkIndex 分片索引
      * @param userId 用户ID
      */
+    //利用redis的bitmap来存储分片上传状态
+    //标记分片为已上传就是将对应的位设置为1
+    //这里也判断分片索引的有效性？
+    //答案是的
+    //为什么？
+    //因为分片索引必须是0或大于0的整数
+    //如果分片索引小于0，说明是无效的分片索引
+    //所以需要判断分片索引的有效性
     public void markChunkUploaded(String fileMd5, int chunkIndex, String userId) {
         logger.debug("标记分片为已上传 => fileMd5: {}, chunkIndex: {}, userId: {}", fileMd5, chunkIndex, userId);
         try {
@@ -375,6 +425,8 @@ public class UploadService {
      * @param fileMd5 文件的 MD5 值
      * @param userId 用户ID
      */
+    //删除文件所有分片上传标记就是删除对应的bitmap
+    //删除bitmap就是删除redis键
     public void deleteFileMark(String fileMd5, String userId) {
         logger.debug("删除文件所有分片上传标记 => fileMd5: {}, userId: {}", fileMd5, userId);
         try {
@@ -395,6 +447,40 @@ public class UploadService {
      * @param userId 用户ID
      * @return 包含已上传分片索引的列表
      */
+    //讲讲整体的实现逻辑
+    //1. 先获取文件的总分片数
+    //2. 再从redis中获取该文件的上传状态bitmap
+    //3. 解析bitmap，找出已上传的分片索引
+    //4. 返回已上传分片索引列表
+
+    //因为文件的分片总数可能很大，所以不能直接返回所有分片的索引
+    //只能返回已上传的分片索引
+    //所以需要解析bitmap，找出已上传的分片索引
+    //分片索引又是啥？
+    //答案是分片在文件中的索引
+    //那个chunkIndex就是分片索引吗？
+    //答案是的
+
+    //这个分片索引列表有什么用？
+    //答案是合并分片时，需要根据分片索引来合并分片内容
+    //也会用来计算上传进度
+
+
+    //这个获取的已上传分片列表是存在redis中的，所以需要从redis中获取
+    //为啥存在redis中？
+    //答案是：为了提高查询效率，将分片上传状态存储在redis中
+    //而不是直接在数据库中查询
+    //因为数据库查询需要扫描所有分片，而redis查询只需要扫描已上传的分片
+    //所以redis查询效率更高
+    //这个分片索引列表中的字段有哪些？
+    //chunkIndex、userId、fileMd5、totalChunks
+
+    //totalChunks是文件的总分片数，用于判断是否需要继续解析bitmap
+    //所以需要判断totalChunks是否为0
+
+    //getUploadedChunks方法返回的列表中是bitmap+chunkIndex吗？
+    //答案是的
+
     public List<Integer> getUploadedChunks(String fileMd5, String userId) {
         logger.info("获取已上传分片列表 => fileMd5: {}, userId: {}", fileMd5, userId);
         List<Integer> uploadedChunks = new ArrayList<>();
@@ -408,17 +494,23 @@ public class UploadService {
             }
             
             // 优化：一次性获取所有分片状态
+            //
+            // 但是，如果文件分片数很多，可能会占用较多内存
+            // 所以这里选择一次性获取所有分片状态
+            // 这里使用redis的get命令来获取bitmap数据
             String redisKey = "upload:" + userId + ":" + fileMd5;
             byte[] bitmapData = redisTemplate.execute((RedisCallback<byte[]>) connection -> {
                 return connection.get(redisKey.getBytes());
             });
-            
+            //
+            // 如果bitmap数据为空，说明文件分片上传状态为空
             if (bitmapData == null) {
                 logger.info("Redis中无分片状态记录 => fileMd5: {}, userId: {}", fileMd5, userId);
                 return uploadedChunks;
             }
             
             // 解析bitmap，找出已上传的分片
+
             for (int chunkIndex = 0; chunkIndex < totalChunks; chunkIndex++) {
                 if (isBitSet(bitmapData, chunkIndex)) {
                     uploadedChunks.add(chunkIndex);
@@ -496,6 +588,15 @@ public class UploadService {
      * @param chunkMd5 分片的 MD5 值
      * @param storagePath 分片的存储路径
      */
+    //这是保存到Mysql？
+    //答案是的
+    //因为分片信息需要持久化存储，所以需要保存到数据库
+    //保存到数据库的字段有哪些？
+    //答案是分片索引、分片的MD5值、分片的存储路径
+
+    //这个发生在哪？
+    //答案是在uploadChunk方法中
+    //uploadChunk方法会在上传分片时，调用saveChunkInfo方法，来保存分片信息到数据库
     private void saveChunkInfo(String fileMd5, int chunkIndex, String chunkMd5, String storagePath) {
         logger.debug("保存分片信息到数据库 => fileMd5: {}, chunkIndex: {}, chunkMd5: {}, storagePath: {}", 
                    fileMd5, chunkIndex, chunkMd5, storagePath);
@@ -567,11 +668,16 @@ public class UploadService {
                 }
             }
             logger.info("分片检查完成，所有分片都存在 => fileMd5: {}, fileName: {}, fileType: {}", fileMd5, fileName, fileType);
-            
+            //chunkIndex是从redis中获取的，所以需要根据chunkIndex来合并分片
+            //这里需要根据chunkIndex来合并分片，因为chunkIndex是有序的，而partPaths是无序的
+
+
             // 使用 MD5 作为 MinIO 对象路径，确保同名不同内容的文件不会互相覆盖
             String mergedPath = "merged/" + fileMd5;
             logger.info("开始合并分片 => fileMd5: {}, fileName: {}, fileType: {}, 合并后路径: {}", fileMd5, fileName, fileType, mergedPath);
-            
+
+            //使用minio的composeObject方法合并分片
+            //这里需要根据chunkIndex来合并分片，因为chunkIndex是有序的，而partPaths是无序的
             try {
                 // 合并分片
                 List<ComposeSource> sources = partPaths.stream()
@@ -652,6 +758,8 @@ public class UploadService {
         }
     }
 
+    //获取合并后的文件流
+    //这个文件流是后续的文件操作，如下载、预览等，都需要使用这个文件流
     public GetObjectResponse getMergedFileStream(String fileMd5) throws Exception {
         return minioClient.getObject(
                 GetObjectArgs.builder()
@@ -660,7 +768,8 @@ public class UploadService {
                         .build()
         );
     }
-
+    //生成合并后的文件URL
+    //这个URL是后续的文件操作，如下载、预览等，都需要使用这个URL
     public String generateMergedObjectUrl(String fileMd5) throws Exception {
         return minioClient.getPresignedObjectUrl(
                 GetPresignedObjectUrlArgs.builder()
@@ -684,6 +793,16 @@ public class UploadService {
         return minioUrl.replaceFirst(minioConfig.getEndpoint(), minioConfig.getPublicUrl());
     }
 
+    //这是检验那个文件上传记录是否存在
+    //如果存在，直接返回
+    //如果不存在，创建新的文件记录
+
+    //这里的文件记录是指文件上传记录，不是文件分片记录
+    //文件上传记录是第一次上传分片的时候创建的
+    //文件上传记录中包含了文件的元数据，如文件名、文件大小、文件类型等
+    //而分片信息虽然也是存储在数据库中的，但是和文件上传记录是分离的
+    //分片信息中包含了分片的索引、用户ID、文件MD5、上传状态bitmap等
+    //分片信息的索引是分片在文件中的索引，用于合并分片时，根据分片索引来合并分片内容
     private FileUpload getOrCreateFileUpload(String fileMd5,
                                              long totalSize,
                                              String fileName,
@@ -711,6 +830,8 @@ public class UploadService {
         try {
             return fileUploadRepository.save(fileUpload);
         } catch (DataIntegrityViolationException e) {
+            //文件记录已存在，按幂等成功处理
+            //
             logger.info("文件记录已存在，按幂等成功处理 => fileMd5: {}, userId: {}", fileMd5, userId);
             return fileUploadRepository.findFirstByFileMd5AndUserIdOrderByCreatedAtDesc(fileMd5, userId)
                     .orElseThrow(() -> new RuntimeException("文件记录并发创建后查询失败", e));
