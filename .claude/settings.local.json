@@ -26,7 +26,10 @@
       "Bash(head -n 1585 d:/Project/PaiSmart-main/src/main/java/com/yizhaoqi/smartpai/service/MinerUService.java)",
       "Bash(echo '}')",
       "Bash(cmd.exe /c \"mvn compile -pl . -q 2>&1 | head -30\")",
-      "Bash(powershell.exe -Command \"mvn compile -pl . -q 2>&1 | Select-Object -First 30\")"
+      "Bash(powershell.exe -Command \"mvn compile -pl . -q 2>&1 | Select-Object -First 30\")",
+      "Bash(redis-cli -a PaiSmart2025 --no-auth-warning KEYS \"*conversation*\")",
+      "Bash(curl -s -X DELETE \"http://localhost:9200/conversation_long_term_memory\")",
+      "Bash(curl -s -u elastic:PaiSmart2025 -X DELETE \"http://localhost:9200/conversation_long_term_memory\")"
     ],
     "additionalDirectories": [
       "d:\\Project\\PaiSmart-main\\target\\classes"

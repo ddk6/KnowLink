@@ -3,6 +3,7 @@ package com.yizhaoqi.smartpai.service;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.yizhaoqi.smartpai.entity.LongTermMemory;
 import com.yizhaoqi.smartpai.entity.SearchResult;
 import com.yizhaoqi.smartpai.exception.RateLimitExceededException;
 import org.slf4j.Logger;
@@ -37,10 +38,14 @@ public class ChatHandler {
     private static final int MAX_CONTEXT_SNIPPET_LEN = 300;
     private static final int MAX_MATCHED_CHUNK_LEN = 800;
     private static final int MAX_EVIDENCE_SNIPPET_LEN = 160;
+    private static final int MAX_CONVERSATION_ROUNDS = 5;  // 最多保留5轮对话（10条消息）
+    private static final int MAX_MESSAGES = MAX_CONVERSATION_ROUNDS * 2;  // 10条消息
     private final RedisTemplate<String, String> redisTemplate;
     private final HybridSearchService searchService;
     private final LlmProviderRouter llmProviderRouter;
     private final RateLimitService rateLimitService;
+    private final UsageQuotaService usageQuotaService;
+    private final ConversationMemoryService conversationMemoryService;
     private final ThreadPoolTaskExecutor chatMonitorExecutor;
     private final ObjectMapper objectMapper;
     
@@ -57,11 +62,15 @@ public class ChatHandler {
                       HybridSearchService searchService,
                       LlmProviderRouter llmProviderRouter,
                       RateLimitService rateLimitService,
+                      UsageQuotaService usageQuotaService,
+                      ConversationMemoryService conversationMemoryService,
                       @Qualifier("chatMonitorExecutor") ThreadPoolTaskExecutor chatMonitorExecutor) {
         this.redisTemplate = redisTemplate;
         this.searchService = searchService;
         this.llmProviderRouter = llmProviderRouter;
         this.rateLimitService = rateLimitService;
+        this.usageQuotaService = usageQuotaService;
+        this.conversationMemoryService = conversationMemoryService;
         this.chatMonitorExecutor = chatMonitorExecutor;
         this.objectMapper = new ObjectMapper();
     }
@@ -84,14 +93,26 @@ public class ChatHandler {
             // 2. 获取对话历史
             List<Map<String, String>> history = getConversationHistory(conversationId);
             logger.debug("获取到 {} 条历史对话", history.size());
-            
+
+            // 2.1 检索长期记忆
+            List<Map<String, Object>> historyRecords = getConversationHistoryRecords(conversationId);
+            String retrievalQuery = conversationMemoryService.buildRetrievalQuery(userMessage, historyRecords);
+            List<LongTermMemory> longTermMemories = conversationMemoryService.retrieveMemories(userId, retrievalQuery, 5);
+            String longTermMemoryContext = buildLongTermMemoryContext(longTermMemories);
+            logger.debug("检索到 {} 条长期记忆", longTermMemories.size());
+
             // 3. 执行带权限过滤的混合搜索
             List<SearchResult> searchResults = searchService.searchWithPermission(userMessage, userId, 5);
             logger.debug("搜索结果数量: {}", searchResults.size());
             
             // 4. 构建上下文
             String context = buildContext(searchResults, session.getId(), userMessage);
-            
+
+            // 4.1 合并长期记忆上下文
+            if (!longTermMemoryContext.isEmpty()) {
+                context = longTermMemoryContext + "\n\n" + context;
+            }
+
             // 5. 调用活动 LLM Provider 并处理流式响应
             logger.info("调用活动 LLM Provider 生成回复");
             llmProviderRouter.streamResponse(userId, userMessage, context, history,
@@ -180,7 +201,7 @@ public class ChatHandler {
         String completeResponse = responseBuilder.toString();
         responseFuture.complete(completeResponse);
         sendCompletionNotification(session);
-        updateConversationHistory(conversationId, userMessage, completeResponse, sessionReferenceMappings.get(session.getId()));
+        updateConversationHistory(conversationId, userId, userMessage, completeResponse, sessionReferenceMappings.get(session.getId()));
         logger.info("对话存储信息 - Redis键: {}, 值: {}", "user:" + userId + ":current_conversation", conversationId);
         cleanupSessionState(session.getId(), null);
         logger.info("消息处理完成，用户ID: {}", userId);
@@ -227,58 +248,152 @@ public class ChatHandler {
 
     private List<Map<String, Object>> getConversationHistoryRecords(String conversationId) {
         String key = "conversation:" + conversationId;
-        String json = redisTemplate.opsForValue().get(key);
         try {
-            if (json == null) {
-                logger.debug("会话 {} 没有历史记录", conversationId);
-                return new ArrayList<>();
+            // 使用 Redis List 获取所有消息
+            List<String> jsonMessages = redisTemplate.opsForList().range(key, 0, -1);
+            if (jsonMessages == null || jsonMessages.isEmpty()) {
+                // 尝试从旧格式 String 迁移
+                return migrateFromStringFormat(conversationId, key);
             }
 
-            List<Map<String, Object>> history = objectMapper.readValue(json, new TypeReference<List<Map<String, Object>>>() {});
+            List<Map<String, Object>> history = new ArrayList<>();
+            for (String json : jsonMessages) {
+                try {
+                    Map<String, Object> message = objectMapper.readValue(json,
+                            new TypeReference<Map<String, Object>>() {});
+                    history.add(message);
+                } catch (JsonProcessingException e) {
+                    logger.warn("解析单条消息失败: {}, 跳过该条", e.getMessage());
+                }
+            }
             logger.debug("读取到会话 {} 的 {} 条历史记录", conversationId, history.size());
             return history;
-        } catch (JsonProcessingException e) {
-            logger.error("解析对话历史出错: {}, 会话ID: {}", e.getMessage(), conversationId, e);
+        } catch (Exception e) {
+            logger.error("读取对话历史出错: {}, 会话ID: {}", e.getMessage(), conversationId, e);
             return new ArrayList<>();
         }
     }
 
-    private void updateConversationHistory(String conversationId, String userMessage, String response,
+    /**
+     * 从旧 String 格式迁移到 List 格式
+     */
+    private List<Map<String, Object>> migrateFromStringFormat(String conversationId, String key) {
+        try {
+            // 尝试作为 String 读取（旧格式）
+            String json = redisTemplate.opsForValue().get(key);
+            if (json != null && !json.isBlank()) {
+                List<Map<String, Object>> history = objectMapper.readValue(json,
+                        new TypeReference<List<Map<String, Object>>>() {});
+                if (history != null && !history.isEmpty()) {
+                    logger.info("检测到旧格式会话数据，开始迁移: conversationId={}, 消息数={}",
+                            conversationId, history.size());
+
+                    // 删除旧 String key
+                    redisTemplate.delete(key);
+
+                    // 重新以 List 格式写入
+                    for (Map<String, Object> msg : history) {
+                        String msgJson = objectMapper.writeValueAsString(msg);
+                        redisTemplate.opsForList().rightPush(key, msgJson);
+                    }
+
+                    // 设置 TTL
+                    redisTemplate.expire(key, Duration.ofDays(7));
+
+                    logger.info("会话数据迁移完成: conversationId={}", conversationId);
+                    return history;
+                }
+            }
+        } catch (Exception e) {
+            logger.warn("迁移旧格式会话数据失败: conversationId={}, error={}", conversationId, e.getMessage());
+        }
+        return new ArrayList<>();
+    }
+
+    private void updateConversationHistory(String conversationId, String userId, String userMessage, String response,
                                            Map<Integer, ReferenceInfo> referenceMapping) {
         String key = "conversation:" + conversationId;
-        List<Map<String, Object>> history = getConversationHistoryRecords(conversationId);
-        
-        // 获取当前时间戳
-        String currentTimestamp = java.time.LocalDateTime.now().format(java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss"));
-        
-        // 添加用户消息（带时间戳）
-        Map<String, Object> userMsgMap = new HashMap<>();
-        userMsgMap.put("role", "user");
-        userMsgMap.put("content", userMessage);
-        userMsgMap.put("timestamp", currentTimestamp);
-        history.add(userMsgMap);
+        String currentTimestamp = java.time.LocalDateTime.now()
+                .format(java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss"));
 
-        // 添加助手回复（带时间戳）
-        Map<String, Object> assistantMsgMap = new HashMap<>();
-        assistantMsgMap.put("role", "assistant");
-        assistantMsgMap.put("content", response);
-        assistantMsgMap.put("timestamp", currentTimestamp);
-        if (referenceMapping != null && !referenceMapping.isEmpty()) {
-            assistantMsgMap.put("referenceMappings", toSerializableReferenceMappings(referenceMapping));
-        }
-        history.add(assistantMsgMap);
-        
-        // 限制历史记录长度，保留最近的20条消息
-        if (history.size() > 20) {
-            history = history.subList(history.size() - 20, history.size());
-        }
-        
         try {
-            String json = objectMapper.writeValueAsString(history);
-            redisTemplate.opsForValue().set(key, json, Duration.ofDays(7));
-            logger.debug("更新会话历史，会话ID: {}, 总消息数: {}", conversationId, history.size());
+            // 检查是否需要迁移旧数据（处理并发/竞态情况）
+            List<Map<String, Object>> overflowMessages = new ArrayList<>();
+            try {
+                // 获取添加前的 size，用于判断是否溢出
+                Long sizeBefore = redisTemplate.opsForList().size(key);
+                int overflowCount = 0;
+                if (sizeBefore != null && sizeBefore >= MAX_MESSAGES) {
+                    overflowCount = 2;  // 每次添加 2 条消息
+                }
+
+                // 提取溢出消息（最旧的 2 条），在 trim 之前获取
+                if (overflowCount > 0) {
+                    List<String> oldMessages = redisTemplate.opsForList().range(key, 0, overflowCount - 1);
+                    if (oldMessages != null) {
+                        for (String json : oldMessages) {
+                            try {
+                                Map<String, Object> msg = objectMapper.readValue(json,
+                                        new TypeReference<Map<String, Object>>() {});
+                                overflowMessages.add(msg);
+                            } catch (JsonProcessingException e) {
+                                logger.warn("解析溢出消息失败: {}", e.getMessage());
+                            }
+                        }
+                    }
+                }
+            } catch (Exception e) {
+                // WRONGTYPE 错误，说明是旧格式，触发迁移
+                if (e.getMessage() != null && e.getMessage().contains("WRONGTYPE")) {
+                    logger.warn("检测到旧格式会话数据，尝试迁移: conversationId={}", conversationId);
+                    overflowMessages = migrateFromStringFormat(conversationId, key);
+                } else {
+                    throw e;
+                }
+            }
+
+            // 添加用户消息（带时间戳和token估算）
+            Map<String, Object> userMsgMap = new HashMap<>();
+            userMsgMap.put("role", "user");
+            userMsgMap.put("content", userMessage);
+            userMsgMap.put("timestamp", currentTimestamp);
+            userMsgMap.put("token_estimate", usageQuotaService.estimateTextTokens(userMessage));
+            String userJson = objectMapper.writeValueAsString(userMsgMap);
+            redisTemplate.opsForList().rightPush(key, userJson);
+
+            // 添加助手回复（带时间戳和token估算）
+            Map<String, Object> assistantMsgMap = new HashMap<>();
+            assistantMsgMap.put("role", "assistant");
+            assistantMsgMap.put("content", response);
+            assistantMsgMap.put("timestamp", currentTimestamp);
+            assistantMsgMap.put("token_estimate", usageQuotaService.estimateTextTokens(response));
+            if (referenceMapping != null && !referenceMapping.isEmpty()) {
+                assistantMsgMap.put("referenceMappings", toSerializableReferenceMappings(referenceMapping));
+            }
+            String assistantJson = objectMapper.writeValueAsString(assistantMsgMap);
+            redisTemplate.opsForList().rightPush(key, assistantJson);
+
+            // 限制历史记录长度，保留最近的5轮对话（10条消息）
+            Long size = redisTemplate.opsForList().size(key);
+            if (size != null && size > MAX_MESSAGES) {
+                // 移除最旧的消息，保持最多 MAX_MESSAGES 条
+                redisTemplate.opsForList().trim(key, size - MAX_MESSAGES, -1);
+            }
+
+            // 刷新 TTL
+            redisTemplate.expire(key, Duration.ofDays(7));
+
+            logger.debug("更新会话历史，会话ID: {}, 消息数: {}", conversationId,
+                    redisTemplate.opsForList().size(key));
+
+            // 如果有溢出消息，触发长期记忆整合
+            if (!overflowMessages.isEmpty()) {
+                logger.info("触发记忆整合: userId={}, conversationId={}, 溢出消息数={}",
+                        userId, conversationId, overflowMessages.size());
+                conversationMemoryService.consolidateMemory(userId, conversationId, overflowMessages);
+            }
         } catch (JsonProcessingException e) {
-            logger.error("序列化对话历史出错: {}, 会话ID: {}", e.getMessage(), conversationId, e);
+            logger.error("序列化对话消息出错: {}, 会话ID: {}", e.getMessage(), conversationId, e);
         }
     }
 
@@ -346,6 +461,40 @@ public class ChatHandler {
         logger.info("保存会话 {} 的引用映射，共 {} 条: {}", sessionId, referenceMapping.size(), referenceMapping);
 
         return context.toString();
+    }
+
+    /**
+     * 构建长期记忆上下文
+     */
+    private String buildLongTermMemoryContext(List<LongTermMemory> memories) {
+        if (memories == null || memories.isEmpty()) {
+            return "";
+        }
+
+        StringBuilder sb = new StringBuilder();
+        sb.append("【长期记忆】\n");
+        for (int i = 0; i < memories.size(); i++) {
+            LongTermMemory mem = memories.get(i);
+            String typeLabel = getMemoryTypeLabel(mem.getMemoryType());
+            sb.append(String.format("[记忆%d-%s] %s\n",
+                    i + 1, typeLabel, mem.getSummary()));
+            if (mem.getDetails() != null && !mem.getDetails().isBlank()) {
+                sb.append(String.format("详情: %s\n", mem.getDetails()));
+            }
+        }
+        return sb.toString();
+    }
+
+    private String getMemoryTypeLabel(String memoryType) {
+        if (memoryType == null) return "未知";
+        return switch (memoryType) {
+            case LongTermMemory.TYPE_TASK -> "任务";
+            case LongTermMemory.TYPE_PREFERENCE -> "偏好";
+            case LongTermMemory.TYPE_FACT -> "事实";
+            case LongTermMemory.TYPE_EPISODE -> "经验";
+            case LongTermMemory.TYPE_CONSTRAINT -> "约束";
+            default -> memoryType;
+        };
     }
 
     private void sendResponseChunk(WebSocketSession session, String chunk) {
