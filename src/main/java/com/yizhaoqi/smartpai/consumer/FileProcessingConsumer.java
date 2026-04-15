@@ -181,6 +181,12 @@ public class FileProcessingConsumer {
     /**
      * V3: 将 MinerU chunks 保存到 document_vectors 表（带 V3 metadata）
      */
+    //这里调用向量化服务，将MinerU解析结果中的文本内容向量化
+    //向量化结果是一个JSON文件，包含向量信息 和 向量使用情况
+    //task就是MinerU解析结果的存储表 字段有：fileMd5, parser, status, createdAt, updatedAt、userId、orgTag、isPublic、userId等
+    //向量化结果会记录向量化使用的模型版本，以及向量化消耗的计算资源
+    //向量化结果会保存到数据库中
+    //向量化结果会返回给前端
     private void saveMinerUChunksToDocumentVector(FileProcessingTask task, MinerUService.MinerUParseResult parseResult) {
         if (parseResult.getChunks() == null || parseResult.getChunks().isEmpty()) {
             log.warn("[MinerU] MinerU 返回的 chunks 为空，跳过保存: fileMd5={}", task.getFileMd5());
@@ -267,10 +273,6 @@ public class FileProcessingConsumer {
     //根据文件MD5保存解析结果
     //为啥要保存解析结果？因为MinerU解析结果是一个JSON文件，包含解析后的文本内容、布局信息、元数据等
     //我们需要将这些信息保存到数据库中，方便后续的检索和分析
-    //那分块是先从数据库中获取解析结果吗？
-    //需要，因为分块需要解析后的文本内容
-    //不能获取解析结果后立马分块吗？
-    //不能，因为解析结果是一个JSON文件，需要先解析成对象，才能获取文本内容
     private void saveMinerUResult(String fileMd5, MinerUService.MinerUParseResult parseResult) {
         MinerUParseResult entity = new MinerUParseResult();
         entity.setFileMd5(fileMd5);
@@ -287,7 +289,6 @@ public class FileProcessingConsumer {
         //分完块后，需要将分块结果保存到数据库中
         //然后再从数据库中获取分块结果，进行向量化操作
         //这个过程中用到了两次数据库操作，一次是保存解析结果，一次是保存分块结果
-
     }
 
     /**
@@ -339,6 +340,7 @@ public class FileProcessingConsumer {
         Path tempFile = Files.createTempFile("mineru_input_", "_" + fileMd5);
 
             //从存储系统minio下载文件到临时路径
+        //
         try (InputStream in = downloadFileFromStorage(filePath);
              OutputStream out = Files.newOutputStream(tempFile)) {
             if (in == null) {
@@ -346,7 +348,7 @@ public class FileProcessingConsumer {
             }
             in.transferTo(out);
         }
-
+        //返回临时文件路径
         return tempFile;
     }
 
