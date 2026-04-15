@@ -14,6 +14,11 @@ import java.util.List;
 import java.util.UUID;
 import java.util.stream.IntStream;
 
+//调用该向量化服务类，会从数据库中获取文件分块内容
+//然后调用外部模型生成向量
+//最后将向量保存到数据库中
+//向量化操作会记录向量化使用的模型版本，以及向量化消耗的计算资源
+
 // 向量化服务类
 @Service
 public class VectorizationService {

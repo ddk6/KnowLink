@@ -31,6 +31,12 @@ import java.util.zip.ZipInputStream;
  * MinerU API 服务
  * 用于调用 MinerU 标准精准 API 进行文档解析
  */
+//这是MinerU API服务类
+    //这里的解析是将文件上传到MinerU服务器，等待解析完成，下载解析结果，解析结果是一个ZIP文件，包含解析后的JSON文件
+    //解析后的JSON文件包含了文档的元数据和内容
+    //元数据包含了文档的标题、作者、创建时间等信息
+    //内容包含了文档的文本内容
+
 @Slf4j
 @Service
 public class MinerUService {

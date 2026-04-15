@@ -60,13 +60,24 @@ public class FileProcessingConsumer {
         this.minerUProperties = minerUProperties;
     }
 
+    //这是处理文件解析任务的方法
+    //从Kafka主题中监听文件解析任务
+    //根据任务类型，选择不同的解析器
+    //如果解析器失败，尝试降级到 Tika 解析
+    //如果 Tika 解析也失败，更新任务状态为 FAILED
+    //如果解析成功，更新任务状态为 COMPLETED
     @KafkaListener(topics = "#{kafkaConfig.getFileProcessingTopic()}", groupId = "#{kafkaConfig.getFileProcessingGroupId()}")
     public void processTask(FileProcessingTask task) {
         log.info("Received task: {}", task);
         log.info("文件权限信息: userId={}, orgTag={}, isPublic={}",
                 task.getUserId(), task.getOrgTag(), task.isPublic());
 
-        // 更新解析状态为 PROCESSING
+        // 更新解析状态为 PROCESSING  这个状态存在哪个表
+        // 这个状态存在mineru_parse_result表中
+        // 这个表是MinerU解析结果的存储表
+        // 这个表的字段有：fileMd5, parser, status, createdAt, updatedAt
+        //这个表存在哪？
+        // 这个表存在数据库中
         updateParseStatus(task.getFileMd5(), "PROCESSING", "MINERU");
 
         try {
@@ -82,7 +93,13 @@ public class FileProcessingConsumer {
             // 更新解析状态为 COMPLETED
             updateParseStatus(task.getFileMd5(), "COMPLETED", null);
 
-        } catch (Exception e) {
+        }
+        //异常处理
+        //如果MinerU解析失败，尝试降级到 Tika 解析
+        //如果 Tika 解析也失败，更新任务状态为 FAILED
+        //如果解析成功，更新任务状态为 COMPLETED
+        //
+        catch (Exception e) {
             log.error("文件解析失败: fileMd5={}", task.getFileMd5(), e);
 
             // 检查是否应该降级到 Tika
@@ -111,11 +128,15 @@ public class FileProcessingConsumer {
         log.info("[MinerU] 开始 MinerU 解析: fileMd5={}", task.getFileMd5());
 
         // 1. 下载文件到临时路径
+        //如果文件是本地文件，直接返回文件流 然后调用MinerU API解析文件
+        //如果文件是远程URL，使用HTTP GET请求下载文件
+        //这里返回的是临时文件的路径
         Path filePath = downloadFileToTemp(task.getFilePath(), task.getFileMd5());
         log.info("[MinerU] 文件下载到临时路径: {}", filePath);
 
         try {
-            // 2. 调用 MinerU API 解析
+            // 2. 调用 MinerU API 解析 将文件名、文件路径、文件MD5值上传到MinerU服务器，等待解析完成，下载解析结果
+            //这个解析结果是一个ZIP文件，包含解析后的JSON文件
             MinerUService.MinerUParseResult parseResult = minerUService.uploadAndParse(
                     filePath,
                     task.getFileName(),
@@ -123,12 +144,19 @@ public class FileProcessingConsumer {
             );
 
             // 3. 保存 MinerU 解析结果到 mineru_parse_result 表
+            //这个表是MinerU解析结果的存储表 字段有：fileMd5, parser, status, createdAt, updatedAt
+            //这个表存在数据库中
             saveMinerUResult(task.getFileMd5(), parseResult);
 
             // 4. V3: 保存 chunks 到 document_vectors 表（带 V3 metadata）
+            //这个表存的是分块后的文本内容
+            //这个表存在数据库中
             saveMinerUChunksToDocumentVector(task, parseResult);
 
             // 5. 向量化处理
+            //这里调用向量化服务，将MinerU解析结果中的文本内容向量化
+            //向量化结果是一个JSON文件，包含向量信息 和 向量使用情况
+            //task就是MinerU解析结果的存储表 字段有：fileMd5, parser, status, createdAt, updatedAt、userId、orgTag、isPublic、userId等
             VectorizationService.VectorizationUsageResult vectorizationResult = vectorizationService.vectorizeWithUsage(
                     task.getFileMd5(),
                     task.getUserId(),
@@ -141,6 +169,7 @@ public class FileProcessingConsumer {
 
         } finally {
             // 6. 清理临时文件
+            //这里删除的是临时文件的路径
             try {
                 Files.deleteIfExists(filePath);
             } catch (IOException e) {
@@ -234,6 +263,14 @@ public class FileProcessingConsumer {
     /**
      * 保存 MinerU 解析结果到数据库
      */
+    //这是保存MinerU解析结果的方法
+    //根据文件MD5保存解析结果
+    //为啥要保存解析结果？因为MinerU解析结果是一个JSON文件，包含解析后的文本内容、布局信息、元数据等
+    //我们需要将这些信息保存到数据库中，方便后续的检索和分析
+    //那分块是先从数据库中获取解析结果吗？
+    //需要，因为分块需要解析后的文本内容
+    //不能获取解析结果后立马分块吗？
+    //不能，因为解析结果是一个JSON文件，需要先解析成对象，才能获取文本内容
     private void saveMinerUResult(String fileMd5, MinerUService.MinerUParseResult parseResult) {
         MinerUParseResult entity = new MinerUParseResult();
         entity.setFileMd5(fileMd5);
@@ -245,11 +282,21 @@ public class FileProcessingConsumer {
         entity.setParseError(parseResult.getParseError());
         mineruParseResultRepository.save(entity);
         log.info("[MinerU] 解析结果已保存: fileMd5={}", fileMd5);
+        //把minerU的解析结果保存到数据库中 以便后续的分块和向量化
+        //分块也是先从数据库中获取解析结果，再进行分块操作
+        //分完块后，需要将分块结果保存到数据库中
+        //然后再从数据库中获取分块结果，进行向量化操作
+        //这个过程中用到了两次数据库操作，一次是保存解析结果，一次是保存分块结果
+
     }
 
     /**
      * 更新文件解析状态
      */
+    //这是更新文件解析状态的方法
+    //根据文件MD5更新解析状态和解析方法
+    //如果解析状态为 COMPLETED 或 FAILED，更新解析时间
+    //如果解析状态为 FAILED，更新解析错误信息
     private void updateParseStatus(String fileMd5, String status, String parseMethod) {
         try {
             fileUploadRepository.findFirstByFileMd5OrderByCreatedAtDesc(fileMd5)
@@ -283,9 +330,15 @@ public class FileProcessingConsumer {
     /**
      * 下载文件到临时路径（用于 MinerU）
      */
+    //minerU比Tika解析文件多了一个临时路径的创建
+    //临时路径是为了在MinerU API解析文件时，能够直接上传文件到MinerU服务器
+
+    //这里返回的是什么？
+    //返回的是临时路径的临时文件路径
     private Path downloadFileToTemp(String filePath, String fileMd5) throws Exception {
         Path tempFile = Files.createTempFile("mineru_input_", "_" + fileMd5);
 
+            //从存储系统minio下载文件到临时路径
         try (InputStream in = downloadFileFromStorage(filePath);
              OutputStream out = Files.newOutputStream(tempFile)) {
             if (in == null) {
@@ -303,6 +356,12 @@ public class FileProcessingConsumer {
      * @param filePath 文件路径或 URL
      * @return 文件输入流
      */
+    //这是从存储系统minio下载文件的方法
+    //如果文件是本地文件，直接返回文件流
+    //如果文件是远程URL，使用HTTP GET请求下载文件
+    //tika解析器直接从文件系统读取文件，不需要临时路径 因此会直接调用downloadFileFromStorage方法返回文件流
+    //但是minerU解析器需要临时路径 因此会先调用downloadFileToTemp方法下载文件到临时文件
+    //然后再从临时文件读取文件流
     private InputStream downloadFileFromStorage(String filePath) throws ServerException, InsufficientDataException, ErrorResponseException, IOException, NoSuchAlgorithmException, InvalidKeyException, InvalidResponseException, XmlParserException, InternalException {
         log.info("Downloading file from storage: {}", filePath);
 
@@ -347,6 +406,9 @@ public class FileProcessingConsumer {
         }
     }
 
+    //这是更新实际Embedding用量的方法
+    //如果任务或向量结果为空，直接返回
+    //如果文件记录不存在，也返回
     private void updateActualEmbeddingUsage(
             FileProcessingTask task,
             VectorizationService.VectorizationUsageResult vectorizationResult
