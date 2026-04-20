@@ -728,12 +728,18 @@ public class AdminController {
                             }
                         }
                         
-                        // 获取对话内容，使用实际的用户名而不是Redis中的ID
+                        // 获取对话内容（存的是List，用List读）
                         String conversationKey = "conversation:" + conversationId;
-                        String json = redisTemplate.opsForValue().get(conversationKey);
-                        if (json != null) {
+                        List<String> jsonMessages = redisTemplate.opsForList().range(conversationKey, 0, -1);
+                        if (jsonMessages != null && !jsonMessages.isEmpty()) {
                             String displayUsername = targetUsername != null ? targetUsername : redisUserId;
-                            processRedisConversation(json, allConversations, displayUsername, conversationId, start_date, end_date);
+                            for (String json : jsonMessages) {
+                                try {
+                                    processRedisConversation(json, allConversations, displayUsername, conversationId, start_date, end_date);
+                                } catch (Exception e) {
+                                    LogUtils.logBusinessError("ADMIN_GET_ALL_CONVERSATIONS", adminUsername, "解析对话消息失败", e);
+                                }
+                            }
                         }
                     }
                 }
@@ -764,15 +770,14 @@ public class AdminController {
     /**
      * 处理Redis中的对话数据
      */
-    private void processRedisConversation(String json, List<Map<String, Object>> targetList, String username,
+    private void processRedisConversation(String jsonMessage, List<Map<String, Object>> targetList, String username,
                                           String conversationId, String startDate, String endDate) throws JsonProcessingException {
-        List<Map<String, Object>> history = objectMapper.readValue(json,
-                new TypeReference<List<Map<String, Object>>>() {});
-        
-        // 解析时间范围
+        Map<String, Object> message = objectMapper.readValue(jsonMessage,
+                new TypeReference<Map<String, Object>>() {});
+
         java.time.LocalDateTime startDateTime = null;
         java.time.LocalDateTime endDateTime = null;
-        
+
         if (startDate != null && !startDate.trim().isEmpty()) {
             try {
                 startDateTime = parseDateTime(startDate);
@@ -780,7 +785,7 @@ public class AdminController {
                 LogUtils.logBusinessError("ADMIN_GET_ALL_CONVERSATIONS", username, "起始时间解析失败: %s", e, startDate);
             }
         }
-        
+
         if (endDate != null && !endDate.trim().isEmpty()) {
             try {
                 endDateTime = parseDateTime(endDate);
@@ -788,49 +793,42 @@ public class AdminController {
                 LogUtils.logBusinessError("ADMIN_GET_ALL_CONVERSATIONS", username, "结束时间解析失败: %s", e, endDate);
             }
         }
-        
-        // 将对话转换为前端需要的格式，使用存储的时间戳并添加用户名
-        for (Map<String, Object> message : history) {
-            String messageTimestamp = String.valueOf(message.getOrDefault("timestamp", "未知时间"));
-            
-            // 时间过滤
-            if (startDateTime != null || endDateTime != null) {
-                if (!"未知时间".equals(messageTimestamp)) {
-                    try {
-                        java.time.LocalDateTime messageDateTime = java.time.LocalDateTime.parse(messageTimestamp, 
-                            java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss"));
-                        
-                        // 检查是否在时间范围内
-                        if (startDateTime != null && messageDateTime.isBefore(startDateTime)) {
-                            continue; // 跳过早于起始时间的消息
-                        }
-                        if (endDateTime != null && messageDateTime.isAfter(endDateTime)) {
-                            continue; // 跳过晚于结束时间的消息
-                        }
-                    } catch (Exception e) {
-                        // 时间戳格式不正确，跳过过滤（包含所有消息）
-                        LogUtils.logBusinessError("ADMIN_GET_ALL_CONVERSATIONS", username, "消息时间戳格式错误: %s", e, messageTimestamp);
+
+        String messageTimestamp = String.valueOf(message.getOrDefault("timestamp", "未知时间"));
+
+        if (startDateTime != null || endDateTime != null) {
+            if (!"未知时间".equals(messageTimestamp)) {
+                try {
+                    java.time.LocalDateTime messageDateTime = java.time.LocalDateTime.parse(messageTimestamp,
+                        java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss"));
+                    if (startDateTime != null && messageDateTime.isBefore(startDateTime)) {
+                        return;
                     }
+                    if (endDateTime != null && messageDateTime.isAfter(endDateTime)) {
+                        return;
+                    }
+                } catch (Exception e) {
+                    LogUtils.logBusinessError("ADMIN_GET_ALL_CONVERSATIONS", username, "消息时间戳格式错误: %s", e, messageTimestamp);
                 }
-                // 如果是"未知时间"且设置了时间过滤，跳过该消息
-                else if (startDateTime != null || endDateTime != null) {
-                    continue;
-                }
+            } else if (startDateTime != null || endDateTime != null) {
+                return;
             }
-            
-            Map<String, Object> messageWithMetadata = new HashMap<>();
-            messageWithMetadata.put("role", message.get("role"));
-            messageWithMetadata.put("content", message.get("content"));
-            messageWithMetadata.put("timestamp", messageTimestamp);
-            messageWithMetadata.put("username", username);
-            messageWithMetadata.put("conversationId", conversationId);
-            if (message.get("referenceMappings") != null) {
-                messageWithMetadata.put("referenceMappings", message.get("referenceMappings"));
-            }
-            targetList.add(messageWithMetadata);
         }
+
+        Map<String, Object> messageWithMetadata = new HashMap<>();
+        messageWithMetadata.put("role", message.get("role"));
+        messageWithMetadata.put("content", message.get("content"));
+        messageWithMetadata.put("timestamp", messageTimestamp);
+        messageWithMetadata.put("username", username);
+        messageWithMetadata.put("conversationId", conversationId);
+        if (message.get("referenceMappings") != null) {
+            messageWithMetadata.put("referenceMappings", message.get("referenceMappings"));
+        }
+        targetList.add(messageWithMetadata);
     }
-    
+
+    /**
+     * 解析日期时间字符串
     /**
      * 解析日期时间字符串，支持多种格式
      */
