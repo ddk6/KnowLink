@@ -9,5 +9,5 @@ public class SmartPaiApplication {
     public static void main(String[] args) {
         SpringApplication.run(SmartPaiApplication.class, args);
     }
-            //试试提交
+    //测试提交
 }
