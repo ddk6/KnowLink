@@ -116,7 +116,7 @@ watch(
     <aside class="invite-side-panel">
       <div class="invite-side-header">
         <div class="invite-side-kicker">邀请码获取</div>
-        <div class="invite-side-title">派聪明RAG实战项目，祝你求职无敌。</div>
+        <div class="invite-side-title">KnowLink RAG实战项目，祝你求职无敌。</div>
         <div class="invite-side-desc">
           微信搜索
           <span class="invite-emphasis">{{ inviteChannelConfig.officialAccountName }}</span>

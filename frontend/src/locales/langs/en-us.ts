@@ -1,6 +1,6 @@
 const local: App.I18n.Schema = {
   system: {
-    title: 'PaiSmart',
+    title: 'KnowLink',
     updateTitle: 'System Version Update Notification',
     updateContent: 'A new version of the system has been detected. Do you want to refresh the page immediately?',
     updateConfirm: 'Refresh immediately',
@@ -218,7 +218,7 @@ const local: App.I18n.Schema = {
         and: 'and',
         policy: '《Privacy Policy》',
         inviteCodeTip:
-          'This site is invite-only. If you do not have an invite code yet, follow the WeChat official account "沉默王二" and reply with "聪明".'
+          'This site is invite-only. If you do not have an invite code yet, follow the WeChat official account "沉默王二" and reply with "KnowLink".'
       },
       resetPwd: {
         title: 'Reset Password'
